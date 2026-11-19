@@ -38,7 +38,14 @@ pub struct Storage {
     /// [System's temporary directory][0] is not used, because it may be located
     /// on another device or has another filesystem, thus doesn't guarantee
     /// atomicity of [copy](async_fs::copy) and [rename](async_fs::rename)
-    /// operations, which is vital for how this directory is used.
+    /// operations, which is vital for how this directory is used: files and
+    /// symlinks are fully created here first, and only then are
+    /// [renamed](async_fs::rename) to their destination in the
+    /// [`Storage::data_dir`], so readers never observe partially written
+    /// data.
+    ///
+    /// The contents of this directory are removed on every [`Storage::new()`],
+    /// cleaning up leftovers of interrupted operations.
     ///
     /// [0]: https://en.wikipedia.org/wiki/Temporary_folder
     tmp_dir: PathBuf,
@@ -115,22 +122,69 @@ where
     #[allow(clippy::blocks_in_conditions)] // due to `instrument` attribute
     #[tracing::instrument(level = "debug", err(Debug))]
     async fn exec(&self, op: CreateFile<S>) -> Result<Self::Ok, Self::Err> {
-        let path = self.data_dir.join(op.path);
-        if let Some(dir) = path.parent() {
-            async_fs::create_dir_all(dir).await.map_err(tracerr::wrap!())?;
-        }
+        // We want files to be written atomically, so a failed or interrupted
+        // upload never leaves a partial file. So, it's required to do this in
+        // 2 steps:
+        // 1. write the whole file into a temporary one, and sync it to disk;
+        // 2. replace the original file with the temporary one.
+        let tmp = self.tmp_dir.join(Uuid::new_v4().to_string());
+        let dest = self.data_dir.join(op.path);
 
-        let mut f = File::create(path).await.map_err(tracerr::wrap!())?;
-
-        let bytes = op.bytes;
-        pin_mut!(bytes);
-        while let Some(res) = bytes.next().await {
-            f.write_all(res.map_err(tracerr::wrap!())?.as_ref())
-                .await
-                .map_err(tracerr::wrap!())?;
+        let mut res = write_file(&tmp, op.bytes).await;
+        if res.is_ok() {
+            res = move_file(&tmp, &dest).await;
         }
-        f.flush().await.map_err(tracerr::wrap!())
+        if res.is_err() {
+            // Best-effort cleanup, the original error is more important.
+            drop(async_fs::remove_file(&tmp).await);
+        }
+        res
     }
+}
+
+/// Writes all the provided `bytes` into a new file at the provided `path`, and
+/// syncs it to disk.
+///
+/// # Errors
+///
+/// - If the file cannot be created.
+/// - If the provided `bytes` [`Stream`] yields an error.
+/// - If writing, flushing or syncing the file fails.
+async fn write_file<S, Bytes>(
+    path: &Path,
+    bytes: S,
+) -> Result<(), Traced<io::Error>>
+where
+    S: Stream<Item = Result<Bytes, io::Error>>,
+    Bytes: AsRef<[u8]>,
+{
+    let mut f = File::create(path).await.map_err(tracerr::wrap!())?;
+
+    pin_mut!(bytes);
+    while let Some(res) = bytes.next().await {
+        f.write_all(res.map_err(tracerr::wrap!())?.as_ref())
+            .await
+            .map_err(tracerr::wrap!())?;
+    }
+    f.flush().await.map_err(tracerr::wrap!())?;
+    f.sync_all().await.map_err(tracerr::wrap!())
+}
+
+/// Atomically moves the file from the `src` path to the `dest` path, creating
+/// all the missing parent directories of the `dest` path.
+///
+/// Replaces the existing file at the `dest` path (if any). If it's a symlink,
+/// then the symlink itself is replaced, not the file it points to.
+///
+/// # Errors
+///
+/// - If the parent directories of the `dest` path cannot be created.
+/// - If [`async_fs::rename()`] fails.
+async fn move_file(src: &Path, dest: &Path) -> Result<(), Traced<io::Error>> {
+    if let Some(dir) = dest.parent() {
+        async_fs::create_dir_all(dir).await.map_err(tracerr::wrap!())?;
+    }
+    async_fs::rename(src, dest).await.map_err(tracerr::wrap!())
 }
 
 /// Operation of a symlink creation.
@@ -257,6 +311,105 @@ impl TryFrom<String> for RelativePath {
 #[derive(Debug, Display, Error)]
 #[display("Invalid `RelativePath` format")]
 pub struct InvalidRelativePathError;
+
+#[cfg(test)]
+mod create_file_spec {
+    use std::{env, io, path::PathBuf};
+
+    use futures::{executor::block_on, stream};
+    use uuid::Uuid;
+
+    use super::{CreateFile, Exec as _, RelativePath, Storage};
+
+    /// Temporary [`Storage`] root, removed on [`Drop`].
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new() -> Self {
+            Self(env::temp_dir().join(format!("baza-{}", Uuid::new_v4())))
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    fn path(s: &str) -> RelativePath {
+        RelativePath::try_from(s.to_owned()).unwrap()
+    }
+
+    fn tmp_is_empty(root: &Root) -> bool {
+        std::fs::read_dir(root.0.join("tmp")).unwrap().next().is_none()
+    }
+
+    #[test]
+    fn writes_file() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            let bytes =
+                stream::iter([Ok(b"hello ".to_vec()), Ok(b"world".into())]);
+
+            storage
+                .exec(CreateFile { path: path("bucket/dir/key"), bytes })
+                .await
+                .unwrap();
+        });
+
+        let stored = std::fs::read(root.0.join("data/bucket/dir/key")).unwrap();
+        assert_eq!(stored, b"hello world");
+        assert!(tmp_is_empty(&root), "`tmp/` is not empty");
+    }
+
+    #[test]
+    fn leaves_nothing_on_stream_error() {
+        let root = Root::new();
+        let res = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            let bytes = stream::iter([
+                Ok(b"partial".to_vec()),
+                Err(io::Error::other("connection reset")),
+            ]);
+
+            storage
+                .exec(CreateFile { path: path("bucket/dir/key"), bytes })
+                .await
+        });
+
+        assert!(res.is_err(), "`CreateFile` should fail");
+        assert!(
+            !root.0.join("data/bucket/dir/key").exists(),
+            "partial file is left at the destination",
+        );
+        assert!(tmp_is_empty(&root), "`tmp/` is not empty");
+    }
+
+    #[test]
+    fn keeps_original_on_stream_error() {
+        let root = Root::new();
+        let res = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            let bytes = stream::iter([Ok(b"original".to_vec())]);
+            storage
+                .exec(CreateFile { path: path("bucket/key"), bytes })
+                .await
+                .unwrap();
+
+            let bytes = stream::iter([
+                Ok(b"partial".to_vec()),
+                Err(io::Error::other("connection reset")),
+            ]);
+            storage.exec(CreateFile { path: path("bucket/key"), bytes }).await
+        });
+
+        assert!(res.is_err(), "`CreateFile` should fail");
+        let stored = std::fs::read(root.0.join("data/bucket/key")).unwrap();
+        assert_eq!(stored, b"original");
+        assert!(tmp_is_empty(&root), "`tmp/` is not empty");
+    }
+}
 
 #[cfg(test)]
 mod relative_path_spec {

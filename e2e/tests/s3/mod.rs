@@ -8,8 +8,8 @@ use cucumber::{gherkin::Step, given, then, when};
 use rusoto_core::{HttpClient, RusotoError, region::Region};
 use rusoto_credential::StaticProvider;
 use rusoto_s3::{
-    GetObjectError, GetObjectRequest, PutObjectError, PutObjectRequest,
-    S3 as _, S3Client,
+    GetObjectError, GetObjectRequest, HeadBucketError, HeadBucketRequest,
+    PutObjectError, PutObjectRequest, S3 as _, S3Client,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -135,6 +135,22 @@ async fn error_is_returned(w: &mut World) {
     }
 }
 
+#[when(regex = r"^checking whether `(\S+)` bucket exists$")]
+async fn checking_bucket_exists(w: &mut World, bucket: String) {
+    let req = HeadBucketRequest { bucket, ..HeadBucketRequest::default() };
+    w.head_bucket_response = Some(s3_client().head_bucket(req).await);
+}
+
+#[then("`NotImplemented` error is returned")]
+async fn not_implemented_error(w: &mut World) {
+    let res = w.head_bucket_response.take().expect("No `HeadBucketResponse`");
+    // `HEAD` responses have no body, so only the status code can be checked.
+    match &res {
+        Err(RusotoError::Unknown(resp)) if resp.status.as_u16() == 501 => {}
+        _ => panic!("Expected `NotImplemented` error, got: {res:#?}"),
+    }
+}
+
 fn assert_invalid_argument(res: Result<(), RusotoError<PutObjectError>>) {
     match &res {
         Err(RusotoError::Unknown(resp))
@@ -153,6 +169,9 @@ async fn put_object(
         .await
         .unwrap_or_else(|e| panic!("`PutObjectRequest` failed: {e}"));
 }
+
+/// Response to a [`HeadBucketRequest`].
+pub(super) type HeadBucketResponse = Result<(), RusotoError<HeadBucketError>>;
 
 /// Response to a [`GetObjectRequest`].
 pub(super) type GetObjectResponse =

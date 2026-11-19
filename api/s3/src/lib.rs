@@ -93,14 +93,14 @@ where
         dto::CompleteMultipartUploadOutput,
         dto::CompleteMultipartUploadError,
     > {
-        unimplemented!()
+        Err(not_implemented("CompleteMultipartUpload").into())
     }
 
     async fn copy_object(
         &self,
         _: dto::CopyObjectRequest,
     ) -> S3StorageResult<dto::CopyObjectOutput, dto::CopyObjectError> {
-        unimplemented!()
+        Err(not_implemented("CopyObject").into())
     }
 
     async fn create_multipart_upload(
@@ -110,28 +110,28 @@ where
         dto::CreateMultipartUploadOutput,
         dto::CreateMultipartUploadError,
     > {
-        unimplemented!()
+        Err(not_implemented("CreateMultipartUpload").into())
     }
 
     async fn create_bucket(
         &self,
         _: dto::CreateBucketRequest,
     ) -> S3StorageResult<dto::CreateBucketOutput, dto::CreateBucketError> {
-        unimplemented!()
+        Err(not_implemented("CreateBucket").into())
     }
 
     async fn delete_bucket(
         &self,
         _: dto::DeleteBucketRequest,
     ) -> S3StorageResult<dto::DeleteBucketOutput, dto::DeleteBucketError> {
-        unimplemented!()
+        Err(not_implemented("DeleteBucket").into())
     }
 
     async fn delete_object(
         &self,
         _: dto::DeleteObjectRequest,
     ) -> S3StorageResult<dto::DeleteObjectOutput, dto::DeleteObjectError> {
-        unimplemented!()
+        Err(not_implemented("DeleteObject").into())
     }
 
     async fn delete_objects(
@@ -139,7 +139,7 @@ where
         _: dto::DeleteObjectsRequest,
     ) -> S3StorageResult<dto::DeleteObjectsOutput, dto::DeleteObjectsError>
     {
-        unimplemented!()
+        Err(not_implemented("DeleteObjects").into())
     }
 
     async fn get_bucket_location(
@@ -149,7 +149,7 @@ where
         dto::GetBucketLocationOutput,
         dto::GetBucketLocationError,
     > {
-        unimplemented!()
+        Err(not_implemented("GetBucketLocation").into())
     }
 
     #[tracing::instrument(
@@ -184,28 +184,28 @@ where
         &self,
         _: dto::HeadBucketRequest,
     ) -> S3StorageResult<dto::HeadBucketOutput, dto::HeadBucketError> {
-        unimplemented!()
+        Err(not_implemented("HeadBucket").into())
     }
 
     async fn head_object(
         &self,
         _: dto::HeadObjectRequest,
     ) -> S3StorageResult<dto::HeadObjectOutput, dto::HeadObjectError> {
-        unimplemented!()
+        Err(not_implemented("HeadObject").into())
     }
 
     async fn list_buckets(
         &self,
         _: dto::ListBucketsRequest,
     ) -> S3StorageResult<dto::ListBucketsOutput, dto::ListBucketsError> {
-        unimplemented!()
+        Err(not_implemented("ListBuckets").into())
     }
 
     async fn list_objects(
         &self,
         _: dto::ListObjectsRequest,
     ) -> S3StorageResult<dto::ListObjectsOutput, dto::ListObjectsError> {
-        unimplemented!()
+        Err(not_implemented("ListObjects").into())
     }
 
     async fn list_objects_v2(
@@ -213,7 +213,7 @@ where
         _: dto::ListObjectsV2Request,
     ) -> S3StorageResult<dto::ListObjectsV2Output, dto::ListObjectsV2Error>
     {
-        unimplemented!()
+        Err(not_implemented("ListObjectsV2").into())
     }
 
     #[tracing::instrument(
@@ -257,7 +257,7 @@ where
         &self,
         _: dto::UploadPartRequest,
     ) -> S3StorageResult<dto::UploadPartOutput, dto::UploadPartError> {
-        unimplemented!()
+        Err(not_implemented("UploadPart").into())
     }
 }
 
@@ -275,6 +275,15 @@ fn parse_relative_path(attr: &str, s: String) -> Result<RelativePath, S3Error> {
             format!("Invalid {attr}: {e}"),
         )
     })
+}
+
+/// Constructs a [`S3ErrorCode::NotImplemented`] [`S3Error`] for the provided
+/// unsupported S3 `operation`.
+fn not_implemented(operation: &str) -> S3Error {
+    S3Error::new(
+        S3ErrorCode::NotImplemented,
+        format!("`{operation}` operation is not implemented"),
+    )
 }
 
 /// Constructs an internal [`S3Error`].

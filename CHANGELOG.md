@@ -16,6 +16,13 @@ All user visible changes to this project will be documented in this file. This p
 - Deployment:
     - [Docker] image is published to `ghcr.io/sleepysquash/baza` only.
 
+### Fixed
+
+- [S3 API]:
+    - Unsupported methods panicking instead of returning a `NotImplemented` error.
+    - `PutObject` leaving a partially written object on a failed or interrupted upload (now written to `tmp/` and renamed atomically).
+    - `PutObject` of a regular file over an existing symlink writing through to the symlink's target instead of replacing the symlink.
+
 
 
 

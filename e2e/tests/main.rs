@@ -25,6 +25,9 @@ struct World {
 
     /// Latest [`s3::GetObjectResponse`] (if any).
     get_object_response: Option<s3::GetObjectResponse>,
+
+    /// Latest [`s3::HeadBucketResponse`] (if any).
+    head_bucket_response: Option<s3::HeadBucketResponse>,
 }
 
 #[tokio::main]
