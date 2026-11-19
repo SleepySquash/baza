@@ -21,8 +21,15 @@ All user visible changes to this project will be documented in this file. This p
     - `DeleteObject` and `DeleteObjects` methods.
     - `HeadObject` method.
     - `ListObjects` and `ListObjectsV2` methods.
+    - `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` and `ListParts` methods.
+    - `Content-MD5` verification in `UploadPart` requests.
     - `Content-Length`, `Content-Type`, `ETag` and `Last-Modified` headers to `GetObject` responses.
+    - `Range` support in `GetObject` requests, and `Accept-Ranges` header to `GetObject` and `HeadObject` responses.
     - HTTP/2 support.
+- [CLI]:
+    - `--multipart-ttl` option specifying time after which incomplete multipart uploads are aborted (24 hours by default).
+- Environment variables:
+    - `BAZA_MULTIPART_TTL` specifying time after which incomplete multipart uploads are aborted.
 
 ### Changed
 

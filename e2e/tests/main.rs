@@ -14,6 +14,10 @@ use rand::{RngExt as _, distr::Alphanumeric};
 /// Path to the directory where files are stored during E2E tests running.
 const DATA_DIR: &str = "../.cache/baza/data";
 
+/// Path to the directory where multipart uploads are stored during E2E tests
+/// running.
+const MULTIPART_DIR: &str = "../.cache/baza/multipart";
+
 #[derive(Debug, Default, cucumber::World)]
 struct World {
     /// Random string of the concrete scenario run, to enrich its data with, for
@@ -37,6 +41,9 @@ struct World {
 
     /// Latest [`s3::ListObjectsResponse`] (if any).
     list_objects_response: Option<s3::ListObjectsResponse>,
+
+    /// [`s3::MultipartUpload`] created in the scenario (if any).
+    multipart_upload: Option<s3::MultipartUpload>,
 
     /// [`s3::ObjectMeta`]s of all the successful `GetObject` and `HeadObject`
     /// requests, in the order they were received.

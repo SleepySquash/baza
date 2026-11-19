@@ -186,6 +186,7 @@ dependencies = [
  "baza-api-s3",
  "baza-lib",
  "clap",
+ "humantime",
  "secrecy",
  "tokio",
  "tracing",
@@ -196,6 +197,7 @@ dependencies = [
 name = "baza-api-s3"
 version = "0.0.0"
 dependencies = [
+ "base64-simd",
  "baza-lib",
  "derive_more",
  "hyper 1.12.0",
@@ -218,6 +220,7 @@ dependencies = [
  "chrono",
  "cucumber",
  "httpdate",
+ "md-5 0.11.0",
  "rand",
  "rusoto_core",
  "rusoto_credential",
@@ -234,6 +237,7 @@ dependencies = [
  "blocking",
  "derive_more",
  "futures",
+ "md-5 0.11.0",
  "tracerr",
  "tracing",
  "uuid",

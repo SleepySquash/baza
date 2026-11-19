@@ -11,6 +11,7 @@ repository = "https://github.com/SleepySquash/baza"
 publish = false
 
 [dependencies]
+base64-simd = "0.8"
 baza = { package = "baza-lib", path = "../../lib" }
 derive_more = { version = "2", features = ["display", "error", "from"] }
 hyper = "1"

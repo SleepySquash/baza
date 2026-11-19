@@ -10,7 +10,7 @@ Fork of the archived [`instrumentisto/baza`](https://github.com/instrumentisto/b
 
 ## Layout
 
-An S3 object `bucket/key` is stored as `<root>/data/<bucket>/<key>`. There's no database, and buckets are top-level directories. `<root>/tmp/` is wiped on every start.
+An S3 object `bucket/key` is stored as `<root>/data/<bucket>/<key>`. There's no database, and buckets are top-level directories. `<root>/tmp/` is wiped on every start. In-progress multipart uploads live in `<root>/multipart/<upload-id>/` and survive restarts until `--multipart-ttl` expires them.
 
 - `src/main.rs`: `baza` binary, the CLI (`clap`).
 - `lib/src/lib.rs`: `baza-lib` (imported as `baza`), the filesystem storage. Each operation is a struct with an `impl Exec<Op> for Storage`. Build paths only through `RelativePath`, which prevents path traversal.

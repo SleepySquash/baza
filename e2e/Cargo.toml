@@ -17,6 +17,7 @@ baza-api-s3 = { path = "../api/s3" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 cucumber = { version = "0.23", features = ["libtest"] }
 httpdate = "1"
+md5 = { package = "md-5", version = "0.11" }
 rand = "0.10"
 rusoto_core = "0.48"
 rusoto_credential = "0.48"

@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
-use baza::Storage;
+use baza::{AbortExpiredUploads, Exec as _, Storage};
 use baza_api_s3 as s3;
 use secrecy::SecretString;
 use tracing::Level;
@@ -15,6 +15,11 @@ async fn main() -> Result<(), String> {
         format!("Failed to initialize `Storage`: {e}: {}", e.trace())
     })?;
 
+    drop(tokio::spawn(abort_expired_uploads(
+        storage.clone(),
+        args.multipart_ttl,
+    )));
+
     s3::run_http_server(
         storage,
         ("0.0.0.0", args.port),
@@ -23,6 +28,31 @@ async fn main() -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("Failed to run S3 HTTP server: {e}"))
+}
+
+/// Maximum interval between checks for expired multipart uploads.
+const MAX_EXPIRED_UPLOADS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Minimum interval between checks for expired multipart uploads.
+const MIN_EXPIRED_UPLOADS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Periodically aborts multipart uploads of the provided [`Storage`] created
+/// more than the provided `ttl` ago, starting right away.
+async fn abort_expired_uploads(storage: Storage, ttl: Duration) {
+    let mut interval = tokio::time::interval(
+        ttl.clamp(MIN_EXPIRED_UPLOADS_INTERVAL, MAX_EXPIRED_UPLOADS_INTERVAL),
+    );
+    loop {
+        _ = interval.tick().await;
+        match storage.exec(AbortExpiredUploads { ttl }).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Aborted {n} expired multipart uploads"),
+            Err(e) => tracing::error!(
+                "Failed to abort expired multipart uploads: {e}: {}",
+                e.trace(),
+            ),
+        }
+    }
 }
 
 /// CLI options.
@@ -38,6 +68,17 @@ struct CliOpts {
     /// Available values: `error`, `warn`, `info`, `debug`, `trace`.
     #[arg(short, long, default_value = "info")]
     log_level: Level,
+
+    /// Time after which incomplete multipart uploads are aborted.
+    ///
+    /// Counted from the upload creation. Examples: `24h`, `30m`, `7days`.
+    #[arg(
+        long,
+        env = "BAZA_MULTIPART_TTL",
+        default_value = "24h",
+        value_parser = humantime::parse_duration,
+    )]
+    multipart_ttl: Duration,
 
     /// Port to run S3 HTTP API on.
     #[arg(short, long, default_value_t = 9294)]

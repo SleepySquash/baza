@@ -1,7 +1,8 @@
 //! S3 HTTP API implementation of Baza.
 
 use std::{
-    error, fmt, io,
+    error, fmt,
+    io::{self, SeekFrom},
     net::{self, ToSocketAddrs},
     pin::Pin,
     task::{Context, Poll},
@@ -9,10 +10,12 @@ use std::{
 };
 
 use baza::{
-    CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, FileList,
-    FileMeta, GetFile, GetFileMeta, ListFiles, ReadOnlyFile, RelativePath,
-    async_trait,
-    futures::{Stream, StreamExt as _},
+    AbortMultipartUpload, CompleteMultipartUpload, CompletedPart, CreateFile,
+    CreateMultipartUpload, CreateSymlink, DeleteFile, DeleteFileError, Exec,
+    FileList, FileMeta, GetFile, GetFileMeta, ListFiles, ListParts, Md5Digest,
+    MultipartUploadError, PartList, ReadOnlyFile, RelativePath, UploadId,
+    UploadPart, async_trait,
+    futures::{AsyncReadExt as _, AsyncSeekExt as _, Stream, StreamExt as _},
 };
 use derive_more::with_trait::{Display, Error, From};
 use hyper::body::Bytes;
@@ -35,6 +38,12 @@ use tokio_util::{compat::FuturesAsyncReadCompatExt as _, io::ReaderStream};
 /// [`dto::PutObjectInput::metadata`] key where [`CreateSymlink::src`] is
 /// expected to be provided.
 pub const SYMLINK_META_KEY: &str = "symlink-to";
+
+/// `Accept-Ranges` header value of `GetObject` and `HeadObject` responses.
+///
+/// `GetObject` supports a single byte range only, as S3 does. `HeadObject`
+/// ignores the requested range, returning the metadata of the whole object.
+const ACCEPT_RANGES: &str = "bytes";
 
 /// Delay before accepting new connections again, after accepting one has
 /// failed (usually because of running out of file descriptors).
@@ -102,14 +111,19 @@ pub enum RunHttpServerError {
 pub struct S3<T>(T);
 
 #[async_trait]
-impl<S, E1, E2, E3, E4, E5, E6> s3s::S3 for S3<S>
+impl<S, E1, E2, E3, E4, E5, E6, E7> s3s::S3 for S3<S>
 where
-    S: Exec<CreateFile<ObjectBody>, Err = E1>
+    S: Exec<AbortMultipartUpload, Ok = (), Err = E7>
+        + Exec<CompleteMultipartUpload, Ok = FileMeta, Err = E7>
+        + Exec<CreateFile<ObjectBody>, Err = E1>
+        + Exec<CreateMultipartUpload, Ok = UploadId, Err = E7>
         + Exec<CreateSymlink, Err = E2>
         + Exec<DeleteFile, Ok = (), Err = E3>
         + Exec<GetFile, Ok = Option<ReadOnlyFile>, Err = E4>
         + Exec<GetFileMeta, Ok = Option<FileMeta>, Err = E5>
         + Exec<ListFiles, Ok = FileList, Err = E6>
+        + Exec<ListParts, Ok = PartList, Err = E7>
+        + Exec<UploadPart<ObjectBody>, Ok = Md5Digest, Err = E7>
         + fmt::Debug
         + Send
         + Sync
@@ -120,7 +134,123 @@ where
     E4: fmt::Display,
     E5: fmt::Display,
     E6: fmt::Display,
+    E7: AsRef<MultipartUploadError> + fmt::Display,
 {
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+            upload_id = req.input.upload_id.as_str(),
+        ),
+    )]
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<dto::AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<dto::AbortMultipartUploadOutput>> {
+        let input = req.input;
+        let op = AbortMultipartUpload {
+            upload_id: parse_upload_id(&input.upload_id)?,
+            path: parse_s3_path(input.bucket, input.key)?,
+        };
+
+        self.0.exec(op).await.map_err(|e| {
+            multipart_error("AbortMultipartUpload operation failed", e)
+        })?;
+
+        tracing::info!("OK");
+        Ok(S3Response::new(dto::AbortMultipartUploadOutput::default()))
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+            upload_id = req.input.upload_id.as_str(),
+        ),
+    )]
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<dto::CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<dto::CompleteMultipartUploadOutput>> {
+        let input = req.input;
+        let parts = input
+            .multipart_upload
+            .and_then(|u| u.parts)
+            .filter(|parts| !parts.is_empty())
+            .ok_or_else(|| {
+                s3_error!(MalformedXML, "At least one part must be specified")
+            })?
+            .into_iter()
+            .map(|part| {
+                let number = part
+                    .part_number
+                    .ok_or_else(|| {
+                        s3_error!(MalformedXML, "`PartNumber` is missing")
+                    })
+                    .and_then(parse_part_number)?;
+                // A malformed `ETag` can never match the one of a part.
+                let md5 = part
+                    .e_tag
+                    .and_then(|t| parse_md5_hex(t.value()))
+                    .ok_or_else(|| {
+                        s3_error!(
+                            InvalidPart,
+                            "Part {number} is missing or has another ETag",
+                        )
+                    })?;
+                Ok(CompletedPart { number, md5 })
+            })
+            .collect::<Result<_, S3Error>>()?;
+        let op = CompleteMultipartUpload {
+            upload_id: parse_upload_id(&input.upload_id)?,
+            path: parse_s3_path(input.bucket.clone(), input.key.clone())?,
+            parts,
+        };
+
+        let meta = self.0.exec(op).await.map_err(|e| {
+            multipart_error("CompleteMultipartUpload operation failed", e)
+        })?;
+        let headers = ObjectHeaders::try_from(&meta)?;
+
+        tracing::info!("OK");
+        Ok(S3Response::new(dto::CompleteMultipartUploadOutput {
+            bucket: Some(input.bucket),
+            e_tag: Some(headers.e_tag),
+            key: Some(input.key),
+            ..dto::CompleteMultipartUploadOutput::default()
+        }))
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+        ),
+    )]
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<dto::CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
+        let input = req.input;
+        let path = parse_s3_path(input.bucket.clone(), input.key.clone())?;
+
+        let id =
+            self.0.exec(CreateMultipartUpload { path }).await.map_err(|e| {
+                multipart_error("CreateMultipartUpload operation failed", e)
+            })?;
+
+        tracing::info!(upload_id = %id, "OK");
+        Ok(S3Response::new(dto::CreateMultipartUploadOutput {
+            bucket: Some(input.bucket),
+            key: Some(input.key),
+            upload_id: Some(id.to_string()),
+            ..dto::CreateMultipartUploadOutput::default()
+        }))
+    }
+
     #[tracing::instrument(
         skip_all,
         fields(
@@ -208,7 +338,7 @@ where
         let input = req.input;
         let path = parse_s3_path(input.bucket, input.key)?;
 
-        let file = self
+        let mut file = self
             .0
             .exec(GetFile { path })
             .await
@@ -216,12 +346,31 @@ where
             .ok_or_else(|| s3_error!(NoSuchKey))?;
 
         let headers = ObjectHeaders::try_from(file.meta())?;
-        let reader = ReaderStream::new(file.compat());
+        let size = file.meta().size;
+        // Unsatisfiable ranges are `InvalidRange` errors (HTTP 416).
+        let range = input.range.map(|r| r.check(size)).transpose()?;
+        let content_range = range.as_ref().map(|r| {
+            format!("bytes {}-{}/{size}", r.start, r.end.saturating_sub(1))
+        });
+        let range = range.unwrap_or(0..size);
+        if range.start > 0 {
+            _ = file.seek(SeekFrom::Start(range.start)).await.map_err(|e| {
+                internal_error("Failed to seek to the requested range", e)
+            })?;
+        }
+        let content_length = i64::try_from(range.end - range.start)
+            .map_err(|e| internal_error("Range is too large", e))?;
+        // Reading is limited to the requested range (or to the size the
+        // object had when opened, if it's appended to concurrently).
+        let reader =
+            ReaderStream::new(file.take(range.end - range.start).compat());
 
         tracing::info!("OK");
         Ok(S3Response::new(dto::GetObjectOutput {
+            accept_ranges: Some(ACCEPT_RANGES.into()),
             body: Some(StreamingBlob::wrap(reader)),
-            content_length: Some(headers.content_length),
+            content_length: Some(content_length),
+            content_range,
             content_type: Some(headers.content_type),
             e_tag: Some(headers.e_tag),
             last_modified: Some(headers.last_modified),
@@ -254,6 +403,7 @@ where
 
         tracing::info!("OK");
         Ok(S3Response::new(dto::HeadObjectOutput {
+            accept_ranges: Some(ACCEPT_RANGES.into()),
             content_length: Some(headers.content_length),
             content_type: Some(headers.content_type),
             e_tag: Some(headers.e_tag),
@@ -367,6 +517,81 @@ where
         fields(
             bucket = req.input.bucket.as_str(),
             key = req.input.key.as_str(),
+            part_number_marker = req.input.part_number_marker,
+            upload_id = req.input.upload_id.as_str(),
+        ),
+    )]
+    async fn list_parts(
+        &self,
+        req: S3Request<dto::ListPartsInput>,
+    ) -> S3Result<S3Response<dto::ListPartsOutput>> {
+        let input = req.input;
+        let max_parts = input.max_parts.map_or(Ok(MAX_PARTS), |n| {
+            usize::try_from(n).map(|n| n.min(MAX_PARTS)).map_err(|_| {
+                s3_error!(InvalidArgument, "`max-parts` cannot be negative")
+            })
+        })?;
+        let part_number_marker =
+            input.part_number_marker.map_or(Ok(0), |n| {
+                // Markers after the last possible part number list nothing.
+                u16::try_from(n.min(MAX_PART_NUMBER.into())).map_err(|_| {
+                    s3_error!(
+                        InvalidArgument,
+                        "`part-number-marker` cannot be negative",
+                    )
+                })
+            })?;
+        let op = ListParts {
+            upload_id: parse_upload_id(&input.upload_id)?,
+            path: parse_s3_path(input.bucket.clone(), input.key.clone())?,
+            part_number_marker,
+            max_parts,
+        };
+
+        let list =
+            self.0.exec(op).await.map_err(|e| {
+                multipart_error("ListParts operation failed", e)
+            })?;
+        let parts = list
+            .parts
+            .iter()
+            .map(|part| {
+                let size = i64::try_from(part.meta.size)
+                    .map_err(|e| internal_error("Part is too large", e))?;
+                Ok(dto::Part {
+                    e_tag: Some(ETag::Strong(md5_hex(&part.md5))),
+                    last_modified: Some(part.meta.modified.into()),
+                    part_number: Some(part.number.into()),
+                    size: Some(size),
+                    ..dto::Part::default()
+                })
+            })
+            .collect::<Result<_, S3Error>>()?;
+
+        tracing::info!("OK");
+        Ok(S3Response::new(dto::ListPartsOutput {
+            bucket: Some(input.bucket),
+            is_truncated: Some(list.is_truncated),
+            key: Some(input.key),
+            max_parts: Some(max_parts.try_into().unwrap_or(i32::MAX)),
+            next_part_number_marker: list
+                .next_part_number_marker
+                .map(Into::into),
+            part_number_marker: input.part_number_marker,
+            parts: Some(parts),
+            storage_class: Some(dto::StorageClass::from_static(
+                dto::StorageClass::STANDARD,
+            )),
+            upload_id: Some(input.upload_id),
+            ..dto::ListPartsOutput::default()
+        }))
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
         ),
     )]
     async fn put_object(
@@ -405,6 +630,54 @@ where
 
         tracing::info!("OK");
         Ok(S3Response::new(dto::PutObjectOutput::default()))
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+            part_number = req.input.part_number,
+            upload_id = req.input.upload_id.as_str(),
+        ),
+    )]
+    async fn upload_part(
+        &self,
+        req: S3Request<dto::UploadPartInput>,
+    ) -> S3Result<S3Response<dto::UploadPartOutput>> {
+        let input = req.input;
+        let content_md5 = input
+            .content_md5
+            .map(|md5| {
+                base64_simd::STANDARD
+                    .decode_to_vec(&md5)
+                    .ok()
+                    .and_then(|md5| Md5Digest::try_from(md5).ok())
+                    .ok_or_else(|| {
+                        s3_error!(InvalidDigest, "Invalid `Content-MD5`")
+                    })
+            })
+            .transpose()?;
+        let op = UploadPart {
+            upload_id: parse_upload_id(&input.upload_id)?,
+            path: parse_s3_path(input.bucket, input.key)?,
+            part_number: parse_part_number(input.part_number)?,
+            bytes: ObjectBody(
+                input.body.unwrap_or_else(|| StreamingBlob::from(Bytes::new())),
+            ),
+            content_md5,
+        };
+
+        let md5 =
+            self.0.exec(op).await.map_err(|e| {
+                multipart_error("UploadPart operation failed", e)
+            })?;
+
+        tracing::info!("OK");
+        Ok(S3Response::new(dto::UploadPartOutput {
+            e_tag: Some(ETag::Strong(md5_hex(&md5))),
+            ..dto::UploadPartOutput::default()
+        }))
     }
 }
 
@@ -620,6 +893,77 @@ impl KeyEncoding {
             }
         }
     }
+}
+
+/// Maximum part number of a multipart upload, as S3 allows.
+const MAX_PART_NUMBER: u16 = 10_000;
+
+/// Default (and maximum) number of parts returned by `ListParts`, as S3 does.
+const MAX_PARTS: usize = 1000;
+
+/// Parses the provided multipart upload ID.
+///
+/// # Errors
+///
+/// With [`S3ErrorCode::NoSuchUpload`] if the `id` is not a valid [`UploadId`],
+/// because no upload can have it, as S3 does.
+fn parse_upload_id(id: &str) -> Result<UploadId, S3Error> {
+    id.parse().map_err(|_| s3_error!(NoSuchUpload))
+}
+
+/// Parses the provided multipart upload part number.
+///
+/// # Errors
+///
+/// If the `number` is not within `1..=`[`MAX_PART_NUMBER`].
+fn parse_part_number(number: i32) -> Result<u16, S3Error> {
+    u16::try_from(number)
+        .ok()
+        .filter(|n| (1..=MAX_PART_NUMBER).contains(n))
+        .ok_or_else(|| {
+            s3_error!(
+                InvalidArgument,
+                "Part number must be an integer between 1 and \
+                 {MAX_PART_NUMBER}, inclusive",
+            )
+        })
+}
+
+/// Formats the provided [`Md5Digest`] as a lowercase hex string, which is the
+/// `ETag` of a multipart upload part.
+fn md5_hex(md5: &Md5Digest) -> String {
+    md5.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parses the provided hex string (in any case) as a [`Md5Digest`].
+///
+/// Returns [`None`] if it's not a valid one.
+fn parse_md5_hex(hex: &str) -> Option<Md5Digest> {
+    if hex.len() != 2 * Md5Digest::default().len() || !hex.is_ascii() {
+        return None;
+    }
+    let mut md5 = Md5Digest::default();
+    for (b, i) in md5.iter_mut().zip((0..hex.len()).step_by(2)) {
+        *b = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+    }
+    Some(md5)
+}
+
+/// Converts the provided error of a multipart upload operation into an
+/// [`S3Error`] with the matching [`S3ErrorCode`].
+fn multipart_error<E>(msg: &str, e: E) -> S3Error
+where
+    E: AsRef<MultipartUploadError> + fmt::Display,
+{
+    let code = match e.as_ref() {
+        MultipartUploadError::BadDigest => S3ErrorCode::BadDigest,
+        MultipartUploadError::EntityTooSmall(_) => S3ErrorCode::EntityTooSmall,
+        MultipartUploadError::InvalidPart(_) => S3ErrorCode::InvalidPart,
+        MultipartUploadError::InvalidPartOrder => S3ErrorCode::InvalidPartOrder,
+        MultipartUploadError::Io(_) => return internal_error(msg, e),
+        MultipartUploadError::NoSuchUpload => S3ErrorCode::NoSuchUpload,
+    };
+    S3Error::with_message(code, e.as_ref().to_string())
 }
 
 /// Parses the provided `bucket` and `key` into a single [`RelativePath`].

@@ -1,22 +1,31 @@
 //! S3 HTTP API E2E (end-to-end) tests.
 
-use std::{collections::HashMap, fmt, io, mem};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt, io, mem,
+};
 
 use baza::futures::{StreamExt as _, stream};
 use baza_api_s3 as s3;
 use cucumber::{gherkin::Step, given, then, when};
+use md5::{Digest as _, Md5};
+use rand::RngExt as _;
 use rusoto_core::{HttpClient, RusotoError, region::Region};
 use rusoto_credential::StaticProvider;
 use rusoto_s3::{
+    AbortMultipartUploadRequest, CompleteMultipartUploadError,
+    CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
+    CompletedMultipartUpload, CompletedPart, CreateMultipartUploadRequest,
     Delete, DeleteObjectError, DeleteObjectRequest, DeleteObjectsError,
     DeleteObjectsOutput, DeleteObjectsRequest, GetObjectError,
     GetObjectRequest, HeadBucketError, HeadBucketRequest, HeadObjectError,
     HeadObjectRequest, ListObjectsRequest, ListObjectsV2Request,
-    ObjectIdentifier, PutObjectError, PutObjectRequest, S3 as _, S3Client,
+    ListPartsRequest, ObjectIdentifier, PutObjectError, PutObjectRequest,
+    S3 as _, S3Client, UploadPartError, UploadPartRequest,
 };
 use tokio::io::AsyncReadExt as _;
 
-use super::{DATA_DIR, World, sample_file};
+use super::{DATA_DIR, MULTIPART_DIR, World, sample_file};
 
 /// URL of S3 HTTP API to run E2E tests against.
 const API_URL: &str = "http://localhost:9294";
@@ -238,11 +247,65 @@ async fn no_keys_reported(w: &mut World) {
 
 #[when(regex = r"^trying to load `(\S+)` from `(\S+)` bucket$")]
 async fn trying_to_load_file(w: &mut World, key: String, bucket: String) {
-    let res = try_get_object(bucket, w.unique.filename(key)).await;
+    let res = try_get_object(bucket, w.unique.filename(key), None).await;
     w.get_object_response = Some(res.map(|(meta, bytes)| {
         w.object_metas.push(meta);
         bytes
     }));
+}
+
+#[when(regex = "^trying to load `(\\S+)` from `(\\S+)` bucket \
+                 with range `([^`]+)`$")]
+async fn trying_to_load_file_range(
+    w: &mut World,
+    key: String,
+    bucket: String,
+    range: String,
+) {
+    let res = try_get_object(bucket, w.unique.filename(key), Some(range)).await;
+    w.get_object_response = Some(res.map(|(meta, bytes)| {
+        w.object_metas.push(meta);
+        bytes
+    }));
+}
+
+#[then(regex = "^bytes `(\\d+)\\.\\.(\\d+)` of `(\\S+)` are returned \
+                 with `Content-Range` of `([^`]+)`$")]
+async fn file_range_is_returned(
+    w: &mut World,
+    start: usize,
+    end: usize,
+    sample: String,
+    content_range: String,
+) {
+    let expected = &sample_file(sample)[start..end];
+
+    let bytes = w
+        .last_get_object_response()
+        .unwrap_or_else(|e| panic!("`GetObjectRequest` failed: {e}"));
+    let meta = w.object_metas.last().expect("No object metadata received");
+
+    assert_eq!(bytes.len(), expected.len(), "size mismatch");
+    assert!(bytes == expected, "Bytes don't match");
+    assert_eq!(
+        meta.content_length,
+        Some(i64::try_from(expected.len()).unwrap()),
+        "`Content-Length` mismatch",
+    );
+    assert_eq!(
+        meta.content_range.as_deref(),
+        Some(content_range.as_str()),
+        "`Content-Range` mismatch",
+    );
+}
+
+#[then("`InvalidRange` error is returned")]
+async fn invalid_range_error(w: &mut World) {
+    let res = w.last_get_object_response();
+    match &res {
+        Err(e) if error_code(e) == "InvalidRange" => {}
+        _ => panic!("Expected `InvalidRange` error, got: {res:#?}"),
+    }
 }
 
 #[when(regex = r"^checking `(\S+)` metadata in `(\S+)` bucket$")]
@@ -511,6 +574,383 @@ async fn listed_with_head_object_metadata(w: &mut World, key: String) {
     );
 }
 
+#[given(
+    regex = r"^a multipart upload was created in `(\S+)` bucket as `(\S+)`$"
+)]
+async fn multipart_upload_created(w: &mut World, bucket: String, key: String) {
+    let key = w.unique.filename(key);
+    let req = CreateMultipartUploadRequest {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        ..CreateMultipartUploadRequest::default()
+    };
+    let out =
+        s3_client().create_multipart_upload(req).await.unwrap_or_else(|e| {
+            panic!("`CreateMultipartUploadRequest` failed: {e}")
+        });
+
+    w.multipart_upload = Some(MultipartUpload {
+        bucket,
+        key,
+        upload_id: out.upload_id.expect("No `UploadId` returned"),
+        parts: BTreeMap::new(),
+        completed_parts: vec![],
+        completed_e_tag: None,
+        last_error: None,
+    });
+}
+
+#[given(regex = r"^part (\d+) of (\d+) (B|KiB|MiB) was uploaded$")]
+#[when(regex = r"^part (\d+) of (\d+) (B|KiB|MiB) is uploaded$")]
+async fn part_uploaded(w: &mut World, number: i64, size: usize, unit: String) {
+    let upload = w.last_multipart_upload();
+    upload_part(upload, number, part_bytes(size, &unit), None)
+        .await
+        .unwrap_or_else(|e| panic!("`UploadPartRequest` failed: {e}"));
+}
+
+#[when(regex = "^trying to upload part (\\d+) of (\\d+) (B|KiB|MiB)\
+                 ( with a wrong Content-MD5)?$")]
+async fn trying_to_upload_part(
+    w: &mut World,
+    number: i64,
+    size: usize,
+    unit: String,
+    wrong_md5: String,
+) {
+    // MD5 digest of no bytes, while parts are never empty.
+    let content_md5 =
+        (!wrong_md5.is_empty()).then(|| "1B2M2Y8AsgTpgAmY7PhCfg==".to_owned());
+
+    let upload = w.last_multipart_upload();
+    let res =
+        upload_part(upload, number, part_bytes(size, &unit), content_md5).await;
+    upload.last_error = res.err().map(|e| error_code(&e));
+}
+
+#[given(regex = r"^the multipart upload was completed with parts `([^`]*)`$")]
+#[when(regex = r"^the multipart upload is completed with parts `([^`]*)`$")]
+async fn multipart_upload_completed(w: &mut World, parts: String) {
+    let upload = w.last_multipart_upload();
+    let out =
+        complete_multipart_upload(upload, &parse_part_numbers(&parts), false)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("`CompleteMultipartUploadRequest` failed: {e}")
+            });
+
+    upload.completed_parts = parse_part_numbers(&parts);
+    upload.completed_e_tag = Some(out.e_tag.expect("No `ETag` returned"));
+}
+
+#[when(regex = "^trying to complete the multipart upload with parts `([^`]*)`\
+                 ( and wrong ETags)?$")]
+async fn trying_to_complete_multipart_upload(
+    w: &mut World,
+    parts: String,
+    wrong_e_tags: String,
+) {
+    let upload = w.last_multipart_upload();
+    let res = complete_multipart_upload(
+        upload,
+        &parse_part_numbers(&parts),
+        !wrong_e_tags.is_empty(),
+    )
+    .await;
+    upload.last_error = res.err().map(|e| error_code(&e));
+}
+
+#[when("the multipart upload is aborted")]
+#[when("trying to abort the multipart upload")]
+async fn multipart_upload_aborted(w: &mut World, step: &Step) {
+    let upload = w.last_multipart_upload();
+    let req = AbortMultipartUploadRequest {
+        bucket: upload.bucket.clone(),
+        key: upload.key.clone(),
+        upload_id: upload.upload_id.clone(),
+        ..AbortMultipartUploadRequest::default()
+    };
+    let res = s3_client().abort_multipart_upload(req).await;
+
+    if step.value.starts_with("trying") {
+        upload.last_error = res.err().map(|e| error_code(&e));
+    } else if let Err(e) = res {
+        panic!("`AbortMultipartUploadRequest` failed: {e}");
+    }
+}
+
+#[then(regex = r"^the multipart upload is stored as `(\S+)`$")]
+async fn multipart_upload_is_stored(
+    w: &mut World,
+    path: String,
+) -> io::Result<()> {
+    let filename = w.unique.filename(path);
+    let upload = w.last_multipart_upload();
+    let expected = upload
+        .completed_parts
+        .iter()
+        .flat_map(|n| upload.parts[n].bytes.iter().copied())
+        .collect::<Vec<_>>();
+
+    let stored = async_fs::read(format!("{DATA_DIR}/{filename}")).await?;
+    assert_eq!(stored.len(), expected.len(), "size mismatch");
+    assert!(stored == expected, "Bytes don't match");
+    Ok(())
+}
+
+#[then(regex = r"^the multipart upload (is removed|still exists)$")]
+async fn multipart_upload_exists(w: &mut World, exists: String) {
+    let upload = w.last_multipart_upload();
+    let is_dir =
+        async_fs::metadata(format!("{MULTIPART_DIR}/{}", upload.upload_id,))
+            .await
+            .is_ok_and(|m| m.is_dir());
+
+    assert_eq!(is_dir, exists == "still exists", "upload {exists}");
+}
+
+#[then(regex = r"^`(\S+)` error is returned for the multipart upload$")]
+async fn multipart_upload_error(w: &mut World, code: String) {
+    let upload = w.last_multipart_upload();
+    let actual = upload.last_error.take().expect("No error returned");
+
+    assert_eq!(actual, code, "S3 error code mismatch");
+}
+
+#[then("the ETags of the uploaded parts are their MD5 digests")]
+async fn part_e_tags_are_md5(w: &mut World) {
+    for (n, part) in &w.last_multipart_upload().parts {
+        let md5 = Md5::digest(&part.bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        assert_eq!(part.e_tag, format!("\"{md5}\""), "part {n}");
+    }
+}
+
+#[then(regex = "^the uploaded parts are listed(?: by (\\d+) per page)? \
+                 in (\\d+) pages?$")]
+async fn parts_are_listed(w: &mut World, max_parts: String, pages: usize) {
+    let max_parts = (!max_parts.is_empty()).then(|| max_parts.parse().unwrap());
+    let upload = w.last_multipart_upload();
+
+    let listed = list_parts(upload, max_parts).await;
+    assert_eq!(listed.len(), pages, "number of pages");
+
+    let listed = listed.into_iter().flatten().collect::<Vec<_>>();
+    let expected = upload
+        .parts
+        .iter()
+        .map(|(n, part)| {
+            (*n, i64::try_from(part.bytes.len()).unwrap(), part.e_tag.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(listed, expected);
+}
+
+#[then("no parts are listed")]
+async fn no_parts_are_listed(w: &mut World) {
+    let listed = list_parts(w.last_multipart_upload(), None).await;
+
+    assert!(listed.iter().all(Vec::is_empty), "parts are listed: {listed:?}");
+}
+
+#[then("the multipart upload has the same ETag as `HeadObject` returns")]
+async fn multipart_upload_e_tag_matches_head_object(w: &mut World) {
+    let upload = w.last_multipart_upload();
+    let req = HeadObjectRequest {
+        bucket: upload.bucket.clone(),
+        key: upload.key.clone(),
+        ..HeadObjectRequest::default()
+    };
+    let head = s3_client()
+        .head_object(req)
+        .await
+        .unwrap_or_else(|e| panic!("`HeadObjectRequest` failed: {e}"));
+
+    assert!(upload.completed_e_tag.is_some(), "No `ETag` returned");
+    assert_eq!(head.e_tag, upload.completed_e_tag, "`ETag` mismatch");
+}
+
+/// Multipart upload created in a scenario.
+#[derive(Clone, Debug)]
+pub(super) struct MultipartUpload {
+    /// Bucket of the upload.
+    bucket: String,
+
+    /// Key of the upload.
+    key: String,
+
+    /// ID of the upload.
+    upload_id: String,
+
+    /// Successfully uploaded parts, by their numbers.
+    parts: BTreeMap<i64, UploadedPart>,
+
+    /// Numbers of the parts the upload was completed with.
+    completed_parts: Vec<i64>,
+
+    /// `ETag` returned on the upload completion.
+    completed_e_tag: Option<String>,
+
+    /// S3 error code of the last failed request of the upload (if any).
+    last_error: Option<String>,
+}
+
+/// Successfully uploaded part of a [`MultipartUpload`].
+#[derive(Clone, Debug)]
+struct UploadedPart {
+    /// Bytes of the part.
+    bytes: Vec<u8>,
+
+    /// `ETag` returned for the part.
+    e_tag: String,
+}
+
+/// Generates random bytes of the provided `size` in the provided `unit`s.
+fn part_bytes(size: usize, unit: &str) -> Vec<u8> {
+    let size = match unit {
+        "B" => size,
+        "KiB" => size * 1024,
+        "MiB" => size * 1024 * 1024,
+        _ => panic!("Unknown size unit `{unit}`"),
+    };
+    rand::rng().random_iter().take(size).collect()
+}
+
+/// Parses the provided comma-separated part numbers.
+fn parse_part_numbers(parts: &str) -> Vec<i64> {
+    parts
+        .split(',')
+        .map(|n| n.trim().parse().expect("Invalid part number"))
+        .collect()
+}
+
+/// Returns the S3 error code of the provided [`RusotoError`].
+fn error_code<E: fmt::Debug>(e: &RusotoError<E>) -> String {
+    match e {
+        RusotoError::Unknown(resp) => resp
+            .body_as_str()
+            .split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map_or_else(|| resp.body_as_str().to_owned(), |(c, _)| c.into()),
+        // Errors known to `rusoto` are its enum variants named after codes.
+        RusotoError::Service(e) => {
+            let e = format!("{e:?}");
+            e.split_once('(').map_or(e.clone(), |(code, _)| code.into())
+        }
+        e => format!("{e:?}"),
+    }
+}
+
+/// Uploads a part of the provided [`MultipartUpload`], remembering it on
+/// success.
+async fn upload_part(
+    upload: &mut MultipartUpload,
+    number: i64,
+    bytes: Vec<u8>,
+    content_md5: Option<String>,
+) -> Result<(), RusotoError<UploadPartError>> {
+    let req = UploadPartRequest {
+        body: Some(bytes.clone().into()),
+        bucket: upload.bucket.clone(),
+        content_length: Some(bytes.len().try_into().unwrap()),
+        content_md5,
+        key: upload.key.clone(),
+        part_number: number,
+        upload_id: upload.upload_id.clone(),
+        ..UploadPartRequest::default()
+    };
+    let out = s3_client().upload_part(req).await?;
+
+    let e_tag = out.e_tag.expect("No `ETag` returned");
+    _ = upload.parts.insert(number, UploadedPart { bytes, e_tag });
+    Ok(())
+}
+
+/// Completes the provided [`MultipartUpload`] with the provided `parts`,
+/// optionally providing wrong `ETag`s for them.
+///
+/// `ETag`s of the parts not uploaded are always wrong.
+async fn complete_multipart_upload(
+    upload: &MultipartUpload,
+    parts: &[i64],
+    wrong_e_tags: bool,
+) -> Result<
+    CompleteMultipartUploadOutput,
+    RusotoError<CompleteMultipartUploadError>,
+> {
+    let parts = parts
+        .iter()
+        .map(|n| CompletedPart {
+            e_tag: Some(
+                upload.parts.get(n).filter(|_| !wrong_e_tags).map_or_else(
+                    || format!("\"{}\"", "0".repeat(32)),
+                    |p| p.e_tag.clone(),
+                ),
+            ),
+            part_number: Some(*n),
+        })
+        .collect();
+    let req = CompleteMultipartUploadRequest {
+        bucket: upload.bucket.clone(),
+        key: upload.key.clone(),
+        multipart_upload: Some(CompletedMultipartUpload { parts: Some(parts) }),
+        upload_id: upload.upload_id.clone(),
+        ..CompleteMultipartUploadRequest::default()
+    };
+
+    s3_client().complete_multipart_upload(req).await
+}
+
+/// Lists all the parts of the provided [`MultipartUpload`] with `ListParts`,
+/// following `NextPartNumberMarker`s, and returns the number, size and `ETag`
+/// of every listed part, by pages.
+async fn list_parts(
+    upload: &MultipartUpload,
+    max_parts: Option<i64>,
+) -> Vec<Vec<(i64, i64, String)>> {
+    let mut pages = vec![];
+    let mut marker = None;
+    while pages.len() < MAX_LIST_PAGES {
+        let req = ListPartsRequest {
+            bucket: upload.bucket.clone(),
+            key: upload.key.clone(),
+            max_parts,
+            part_number_marker: marker.take(),
+            upload_id: upload.upload_id.clone(),
+            ..ListPartsRequest::default()
+        };
+        let out = s3_client()
+            .list_parts(req)
+            .await
+            .unwrap_or_else(|e| panic!("`ListPartsRequest` failed: {e}"));
+
+        pages.push(
+            out.parts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.part_number.expect("No `PartNumber` in `Part`"),
+                        p.size.expect("No `Size` in `Part`"),
+                        p.e_tag.expect("No `ETag` in `Part`"),
+                    )
+                })
+                .collect(),
+        );
+        if out.is_truncated != Some(true) {
+            return pages;
+        }
+        marker = Some(
+            out.next_part_number_marker
+                .expect("No `NextPartNumberMarker` returned"),
+        );
+    }
+    panic!("More than {MAX_LIST_PAGES} pages listed");
+}
+
 /// Returns the name of the bucket unique to the provided [`World`], which is
 /// not shared with other scenarios, so its listings are predictable.
 fn new_bucket(w: &World) -> String {
@@ -562,6 +1002,9 @@ pub(super) type HeadObjectResponse =
 pub(super) struct ObjectMeta {
     /// `Content-Length` of the object.
     content_length: Option<i64>,
+
+    /// `Content-Range` of the returned part of the object (if requested).
+    content_range: Option<String>,
 
     /// `ETag` of the object.
     e_tag: Option<String>,
@@ -754,10 +1197,12 @@ async fn try_delete_object(
 async fn try_get_object(
     bucket: impl ToString,
     key: impl ToString,
+    range: Option<String>,
 ) -> Result<(ObjectMeta, Vec<u8>), RusotoError<GetObjectError>> {
     let req = GetObjectRequest {
         bucket: bucket.to_string(),
         key: key.to_string(),
+        range,
         ..GetObjectRequest::default()
     };
 
@@ -767,6 +1212,7 @@ async fn try_get_object(
 
     let meta = ObjectMeta {
         content_length: resp.content_length,
+        content_range: resp.content_range,
         e_tag: resp.e_tag,
         last_modified: resp.last_modified,
     };
@@ -780,6 +1226,7 @@ async fn head_object(w: &mut World, bucket: String, key: String) {
 
     let res = s3_client().head_object(req).await.map(|resp| ObjectMeta {
         content_length: resp.content_length,
+        content_range: None,
         e_tag: resp.e_tag,
         last_modified: resp.last_modified,
     });
@@ -800,6 +1247,15 @@ fn s3_client() -> S3Client {
 }
 
 impl World {
+    /// Returns the [`MultipartUpload`] stored in this [`World`].
+    ///
+    /// # Panics
+    ///
+    /// If there is no [`MultipartUpload`] in this [`World`].
+    fn last_multipart_upload(&mut self) -> &mut MultipartUpload {
+        self.multipart_upload.as_mut().expect("No `MultipartUpload` created")
+    }
+
     /// Takes the last [`GetObjectResponse`], stored in this [`World`].
     ///
     /// # Panics
