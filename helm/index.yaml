@@ -2,8 +2,20 @@ apiVersion: v1
 entries:
   baza:
   - apiVersion: v2
+    appVersion: "0.3"
+    created: "2026-11-19T14:09:03.497777279Z"
+    description: Simply scalable files storage without much fuss.
+    digest: 5773fd7ea6e5924ada949f1525f12aa54045dd54b40273a102eea01398d7c43d
+    name: baza
+    sources:
+    - https://github.com/SleepySquash/baza
+    type: application
+    urls:
+    - https://SleepySquash.github.io/baza/helm/baza-0.6.0.tgz
+    version: 0.6.0
+  - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.162065102Z"
+    created: "2026-11-19T14:09:03.497270315Z"
     description: Simply scalable files storage without much fuss.
     digest: 3b735ce2dd459432392ab37e015f35a776238cc4efe1965784de749f484b6d89
     name: baza
@@ -11,11 +23,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.5.0.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.5.0.tgz
     version: 0.5.0
   - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.161574511Z"
+    created: "2026-11-19T14:09:03.496818116Z"
     description: Simply scalable files storage without much fuss.
     digest: fb7b3fd26c47c19088295d6f0d63670ef5f40036cf3b851e8d8c5a8c0c889743
     name: baza
@@ -23,11 +35,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.4.2.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.4.2.tgz
     version: 0.4.2
   - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.16100466Z"
+    created: "2026-11-19T14:09:03.496389246Z"
     description: Simply scalable files storage without much fuss.
     digest: 364299acef28f071c0c0880d84605a9f1a25b17440fea9f1e132073ae7d7656f
     name: baza
@@ -35,11 +47,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.4.1.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.4.1.tgz
     version: 0.4.1
   - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.160308953Z"
+    created: "2026-11-19T14:09:03.495933336Z"
     description: Simply scalable files storage without much fuss.
     digest: 01b7361691adeaaff7d94161b6437006cf1c122a0c7bded9068318eb1d2d4b04
     name: baza
@@ -47,11 +59,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.4.0.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.4.0.tgz
     version: 0.4.0
   - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.159733713Z"
+    created: "2026-11-19T14:09:03.495470777Z"
     description: Simply scalable files storage without much fuss.
     digest: 58bef452fd6c051392022994dbdf757b5a363c26a24a01daf56634d475367e82
     name: baza
@@ -59,11 +71,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.3.0.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.3.0.tgz
     version: 0.3.0
   - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.159217192Z"
+    created: "2026-11-19T14:09:03.495023557Z"
     description: Simply scalable files storage without much fuss.
     digest: 06d512b8e7dfd03e53522441801749338e992ef6e9216d944fccb21ee73fe1a1
     name: baza
@@ -71,11 +83,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.2.0.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.2.0.tgz
     version: 0.2.0
   - apiVersion: v2
     appVersion: "0.2"
-    created: "2025-12-05T17:12:47.158755966Z"
+    created: "2026-11-19T14:09:03.494498983Z"
     description: Simply scalable files storage without much fuss.
     digest: 41a7dc86a598b7a36604a13f7f15505dc4c0048b80582ef24570f85135eb2a09
     name: baza
@@ -83,11 +95,11 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.1.1.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.1.1.tgz
     version: 0.1.1
   - apiVersion: v2
     appVersion: "0.1"
-    created: "2025-12-05T17:12:47.15829501Z"
+    created: "2026-11-19T14:09:03.493952423Z"
     description: Simply scalable files storage without much fuss.
     digest: 02f35d087163b193e96eb903b9973b856d773eaae003ec298f42be381cc66998
     name: baza
@@ -95,6 +107,6 @@ entries:
     - https://github.com/instrumetisto/baza
     type: application
     urls:
-    - https://instrumentisto.github.io/baza/helm/baza-0.1.0.tgz
+    - https://SleepySquash.github.io/baza/helm/baza-0.1.0.tgz
     version: 0.1.0
-generated: "2025-12-05T17:12:47.157668603Z"
+generated: "2026-11-19T14:09:03.492854813Z"
