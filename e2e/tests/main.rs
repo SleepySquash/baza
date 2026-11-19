@@ -35,6 +35,9 @@ struct World {
     /// Latest [`s3::HeadObjectResponse`] (if any).
     head_object_response: Option<s3::HeadObjectResponse>,
 
+    /// Latest [`s3::ListObjectsResponse`] (if any).
+    list_objects_response: Option<s3::ListObjectsResponse>,
+
     /// [`s3::ObjectMeta`]s of all the successful `GetObject` and `HeadObject`
     /// requests, in the order they were received.
     object_metas: Vec<s3::ObjectMeta>,

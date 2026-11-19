@@ -459,6 +459,221 @@ impl Exec<GetFileMeta> for Storage {
     }
 }
 
+/// Operation of listing files of a bucket, in S3 `ListObjects` terms.
+///
+/// Files are listed by their keys relative to the [`ListFiles::bucket`]
+/// (`/`-joined path components), in lexicographic byte order, as S3 does.
+///
+/// Returns an empty [`FileList`] if the [`ListFiles::bucket`] doesn't exist,
+/// because buckets are just directories, which are removed once their last file
+/// is [deleted](DeleteFile), so a missing bucket is indistinguishable from an
+/// empty one.
+///
+/// # Symlinks
+///
+/// Symlinks are listed as files, with the [`FileMeta`] of the file they point
+/// to. Dangling symlinks and symlinks to directories are skipped, the same way
+/// [`GetFile`] and [`GetFileMeta`] return [`None`] for them.
+///
+/// Anything else that is neither a regular file nor a directory (as well as
+/// entries whose names are not valid UTF-8) is skipped too.
+///
+/// # Performance
+///
+/// There is no index: the whole bucket directory tree (except the directories
+/// not matching the [`ListFiles::prefix`]) is walked and sorted on every
+/// execution, which is fine for small buckets only.
+#[derive(Clone, Debug)]
+pub struct ListFiles {
+    /// [`RelativePath`] of the bucket to list files of.
+    pub bucket: RelativePath,
+
+    /// Prefix the listed keys must start with.
+    pub prefix: String,
+
+    /// Delimiter grouping the listed keys into [`FileList::common_prefixes`].
+    ///
+    /// Keys containing this delimiter after the [`ListFiles::prefix`] are not
+    /// listed as files. Instead, their parts up to (and including) the first
+    /// occurrence of this delimiter after the [`ListFiles::prefix`] are listed
+    /// as common prefixes, each one only once.
+    ///
+    /// [`None`] or an empty delimiter means no grouping.
+    pub delimiter: Option<String>,
+
+    /// Key (or common prefix) to list the entries after (exclusively).
+    pub start_after: Option<String>,
+
+    /// Maximum number of entries (both files and common prefixes) to list.
+    pub max_keys: usize,
+}
+
+#[async_trait]
+impl Exec<ListFiles> for Storage {
+    type Ok = FileList;
+    type Err = Traced<io::Error>;
+
+    #[allow(clippy::blocks_in_conditions)] // due to `instrument` attribute
+    #[tracing::instrument(level = "debug", err(Debug))]
+    async fn exec(&self, op: ListFiles) -> Result<Self::Ok, Self::Err> {
+        let dir = self.data_dir.join(&op.bucket);
+
+        // `std::fs` is used in a single blocking task, rather than `async_fs`,
+        // because the latter spawns a blocking task for every single call.
+        blocking::unblock(move || list_files(&dir, &op)).await
+    }
+}
+
+/// Lists files of the provided bucket `dir`ectory, as described by the
+/// provided [`ListFiles`] operation.
+///
+/// # Errors
+///
+/// If reading any directory or file metadata fails with anything other than
+/// [`is_missing()`] (which happens on concurrent modifications).
+fn list_files(
+    dir: &Path,
+    op: &ListFiles,
+) -> Result<FileList, Traced<io::Error>> {
+    let delimiter = op.delimiter.as_deref().filter(|d| !d.is_empty());
+
+    let mut candidates = walk_dir(dir, &op.prefix).map_err(tracerr::wrap!())?;
+    candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut list = FileList::default();
+    let mut last = None::<String>;
+    for (key, path) in candidates {
+        let common_prefix = delimiter.and_then(|d| {
+            key[op.prefix.len()..]
+                .find(d)
+                .map(|i| key[..op.prefix.len() + i + d.len()].to_owned())
+        });
+        let entry = common_prefix.as_ref().unwrap_or(&key);
+
+        if op.start_after.as_ref().is_some_and(|after| entry <= after)
+            || last.as_ref() == Some(entry)
+        {
+            continue;
+        }
+
+        // Metadata is taken lazily, only for the entries being listed.
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => {
+                FileMeta::from_metadata(&meta).map_err(tracerr::wrap!())?
+            }
+            Err(e) if is_missing(&e) => None,
+            Err(e) => return Err(tracerr::new!(e)),
+        };
+        let Some(meta) = meta else {
+            // A dangling symlink, a symlink to a directory, or a file removed
+            // concurrently.
+            continue;
+        };
+
+        if list.files.len() + list.common_prefixes.len() >= op.max_keys {
+            list.is_truncated = true;
+            break;
+        }
+        if let Some(prefix) = common_prefix {
+            list.common_prefixes.push(prefix.clone());
+            last = Some(prefix);
+        } else {
+            last = Some(key.clone());
+            list.files.push(ListedFile { key, meta });
+        }
+    }
+    if list.is_truncated {
+        list.next_start_after = last;
+    }
+
+    Ok(list)
+}
+
+/// Recursively walks the provided bucket `dir`ectory, returning keys (along
+/// with their filesystem paths) of all the regular files and symlinks in it,
+/// starting with the provided `prefix`, in no particular order.
+///
+/// Directories whose keys cannot start with the `prefix` are not walked.
+///
+/// # Errors
+///
+/// If reading any directory fails with anything other than [`is_missing()`]
+/// (which happens on concurrent modifications).
+fn walk_dir(dir: &Path, prefix: &str) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut found = vec![];
+
+    let mut dirs = vec![(dir.to_owned(), String::new())];
+    while let Some((dir, dir_key)) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if is_missing(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned)
+            else {
+                tracing::warn!(
+                    "Skipping non-UTF-8 `{}` path",
+                    entry.path().display(),
+                );
+                continue;
+            };
+            let key = format!("{dir_key}{name}");
+
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(e) if is_missing(&e) => continue,
+                Err(e) => return Err(e),
+            };
+            if file_type.is_dir() {
+                let dir_key = format!("{key}/");
+                if dir_key.starts_with(prefix) || prefix.starts_with(&dir_key) {
+                    dirs.push((entry.path(), dir_key));
+                }
+            } else if (file_type.is_file() || file_type.is_symlink())
+                && key.starts_with(prefix)
+            {
+                found.push((key, entry.path()));
+            }
+        }
+    }
+
+    Ok(found)
+}
+
+/// Result of executing a [`ListFiles`] operation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileList {
+    /// Listed files, in lexicographic byte order of their keys.
+    pub files: Vec<ListedFile>,
+
+    /// Listed common prefixes, in lexicographic byte order.
+    ///
+    /// See [`ListFiles::delimiter`] for details.
+    pub common_prefixes: Vec<String>,
+
+    /// Indicator whether there are more entries to list after the listed ones,
+    /// which haven't been listed due to [`ListFiles::max_keys`].
+    pub is_truncated: bool,
+
+    /// [`ListFiles::start_after`] to list the next entries with, if this
+    /// [`FileList`] [is truncated](FileList::is_truncated).
+    ///
+    /// It's the last listed entry (either a file key or a common prefix).
+    pub next_start_after: Option<String>,
+}
+
+/// File listed by a [`ListFiles`] operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListedFile {
+    /// Key of the file, relative to the [`ListFiles::bucket`].
+    pub key: String,
+
+    /// [`FileMeta`] of the file.
+    pub meta: FileMeta,
+}
+
 /// Indicates whether the provided [`io::Error`] means that there is no file at
 /// the accessed path.
 ///
@@ -975,6 +1190,213 @@ mod get_file_meta_spec {
                 .expect("no `ReadOnlyFile` returned");
 
             assert_eq!(Some(*file.meta()), meta(&storage, "bucket/key").await);
+        });
+    }
+}
+
+#[cfg(test)]
+mod list_files_spec {
+    use std::fs;
+
+    use futures::{executor::block_on, stream};
+
+    use super::{
+        CreateFile, CreateSymlink, DeleteFile, Exec as _, FileList, ListFiles,
+        Storage,
+        spec_util::{Root, path},
+    };
+
+    async fn create(storage: &Storage, p: &str, bytes: &[u8]) {
+        let bytes = stream::iter([Ok(bytes.to_vec())]);
+        storage.exec(CreateFile { path: path(p), bytes }).await.unwrap();
+    }
+
+    async fn list(
+        storage: &Storage,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> FileList {
+        storage
+            .exec(ListFiles {
+                bucket: path("bucket"),
+                prefix: prefix.into(),
+                delimiter: delimiter.map(Into::into),
+                start_after: start_after.map(Into::into),
+                max_keys,
+            })
+            .await
+            .unwrap()
+    }
+
+    fn keys(list: &FileList) -> Vec<&str> {
+        list.files.iter().map(|f| f.key.as_str()).collect()
+    }
+
+    #[test]
+    fn lists_keys_in_lexicographic_order() {
+        let root = Root::new();
+        let list = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            for p in ["a/b", "a-b", "a0", "b/c/d", "a/a", "Z"] {
+                create(&storage, &format!("bucket/{p}"), b"bytes").await;
+            }
+            create(&storage, "other/key", b"bytes").await;
+
+            list(&storage, "", None, None, 1000).await
+        });
+
+        assert_eq!(keys(&list), ["Z", "a-b", "a/a", "a/b", "a0", "b/c/d"]);
+        assert!(list.common_prefixes.is_empty());
+        assert!(!list.is_truncated);
+        assert_eq!(list.next_start_after, None);
+        assert!(list.files.iter().all(|f| f.meta.size == 5));
+    }
+
+    #[test]
+    fn filters_by_prefix() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            for p in ["a/b", "a-b", "ab/c", "abc", "b"] {
+                create(&storage, &format!("bucket/{p}"), b"bytes").await;
+            }
+
+            let l = list(&storage, "a", None, None, 1000).await;
+            assert_eq!(keys(&l), ["a-b", "a/b", "ab/c", "abc"]);
+
+            let l = list(&storage, "ab", None, None, 1000).await;
+            assert_eq!(keys(&l), ["ab/c", "abc"]);
+
+            let l = list(&storage, "a/", None, None, 1000).await;
+            assert_eq!(keys(&l), ["a/b"]);
+
+            let l = list(&storage, "missing", None, None, 1000).await;
+            assert_eq!(l, FileList::default());
+        });
+    }
+
+    #[test]
+    fn groups_by_delimiter() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            for p in ["a/b/c", "a/b/d", "a/e", "a-b", "f"] {
+                create(&storage, &format!("bucket/{p}"), b"bytes").await;
+            }
+            fs::create_dir_all(root.0.join("data/bucket/empty/dir")).unwrap();
+
+            let l = list(&storage, "", Some("/"), None, 1000).await;
+            assert_eq!(keys(&l), ["a-b", "f"]);
+            assert_eq!(l.common_prefixes, ["a/"]);
+
+            let l = list(&storage, "a/", Some("/"), None, 1000).await;
+            assert_eq!(keys(&l), ["a/e"]);
+            assert_eq!(l.common_prefixes, ["a/b/"]);
+
+            let l = list(&storage, "a", Some("-"), None, 1000).await;
+            assert_eq!(keys(&l), ["a/b/c", "a/b/d", "a/e"]);
+            assert_eq!(l.common_prefixes, ["a-"]);
+
+            let l = list(&storage, "", Some(""), None, 1000).await;
+            assert_eq!(keys(&l).len(), 5);
+            assert!(l.common_prefixes.is_empty());
+        });
+    }
+
+    #[test]
+    fn paginates() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            for p in ["a/1", "a/2", "b", "c/1", "d"] {
+                create(&storage, &format!("bucket/{p}"), b"bytes").await;
+            }
+
+            let (mut files, mut prefixes, mut after) = (vec![], vec![], None);
+            let mut pages = 0;
+            loop {
+                let l =
+                    list(&storage, "", Some("/"), after.as_deref(), 2).await;
+                pages += 1;
+                files.extend(l.files.into_iter().map(|f| f.key));
+                prefixes.extend(l.common_prefixes);
+                if !l.is_truncated {
+                    assert_eq!(l.next_start_after, None);
+                    break;
+                }
+                after =
+                    Some(l.next_start_after.expect("no `next_start_after`"));
+            }
+
+            assert_eq!(pages, 2);
+            assert_eq!(files, ["b", "d"]);
+            assert_eq!(prefixes, ["a/", "c/"]);
+
+            let l = list(&storage, "", None, Some("a/1"), 2).await;
+            assert_eq!(keys(&l), ["a/2", "b"]);
+            assert!(l.is_truncated);
+            assert_eq!(l.next_start_after.as_deref(), Some("b"));
+
+            let l = list(&storage, "", None, Some("b"), 3).await;
+            assert_eq!(keys(&l), ["c/1", "d"]);
+            assert!(!l.is_truncated, "exactly `max_keys` remain");
+
+            let l = list(&storage, "", None, None, 0).await;
+            assert!(l.files.is_empty());
+            assert!(l.is_truncated);
+        });
+    }
+
+    #[test]
+    fn lists_symlinks_with_target_meta() {
+        let root = Root::new();
+        let list = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "other/target", b"hello world").await;
+            create(&storage, "other/gone", b"bytes").await;
+            create(&storage, "other/dir/file", b"bytes").await;
+            for (src, dest) in [
+                ("other/target", "bucket/link"),
+                ("other/gone", "bucket/dangling"),
+                ("other/dir", "bucket/dir-link"),
+            ] {
+                storage
+                    .exec(CreateSymlink { src: path(src), dest: path(dest) })
+                    .await
+                    .unwrap();
+            }
+            storage
+                .exec(DeleteFile { path: path("other/gone") })
+                .await
+                .unwrap();
+
+            list(&storage, "", Some("/"), None, 1000).await
+        });
+
+        assert_eq!(keys(&list), ["link"]);
+        assert_eq!(list.files[0].meta.size, 11);
+        assert!(list.common_prefixes.is_empty());
+    }
+
+    #[test]
+    fn returns_empty_list_for_missing_bucket() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket-other/key", b"bytes").await;
+
+            assert_eq!(
+                list(&storage, "", None, None, 1000).await,
+                FileList::default(),
+            );
+
+            fs::create_dir(root.0.join("data/bucket")).unwrap();
+            assert_eq!(
+                list(&storage, "", Some("/"), None, 1000).await,
+                FileList::default(),
+            );
         });
     }
 }

@@ -17,6 +17,7 @@ All user visible changes to this project will be documented in this file. This p
     - `DeleteObject` and `DeleteObjects` methods (deleting a symlink removes only the symlink itself, and empty parent directories are removed).
     - `HeadObject` method (a symlink reports the metadata of the object it points to).
     - `Content-Length`, `Content-Type`, `ETag` and `Last-Modified` headers to `GetObject` responses (`ETag` is derived from the object's size and modification time, rather than being an MD5 digest of its content, and `Content-Type` is always `application/octet-stream`).
+    - `ListObjects` and `ListObjectsV2` methods, supporting `prefix`, `delimiter`, `max-keys`, `marker`/`start-after`/`continuation-token` pagination and `encoding-type=url` (symlinks are listed with the metadata of the objects they point to, dangling symlinks are skipped, a missing bucket is listed as an empty one, and at most one common prefix is returned per page).
 
 ### Changed
 
@@ -30,6 +31,7 @@ All user visible changes to this project will be documented in this file. This p
     - `PutObject` leaving a partially written object on a failed or interrupted upload (now written to `tmp/` and renamed atomically).
     - `PutObject` of a regular file over an existing symlink writing through to the symlink's target instead of replacing the symlink.
     - `GetObject` of a key that is a prefix of other objects (a directory on disk) failing instead of returning a `NoSuchKey` error.
+    - Object keys with URL-encoded characters (like spaces) being stored in their URL-encoded form (`a%20b` instead of `a b`).
 
 
 

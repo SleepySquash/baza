@@ -15,7 +15,9 @@ baza = { package = "baza-lib", path = "../../lib" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 derive_more = { version = "2", features = ["display", "error", "from"] }
 hyper = "0.14"
-# Same version as `s3-server` uses, to name its `dto` types not re-exported.
+percent-encoding = "2.2"
+# Same version as `s3-server` uses, to name its `dto` types not re-exported
+# (`CommonPrefix` and `S3Error`).
 rusoto_s3 = { version = "0.47", default-features = false }
 s3-server = "0.2"
 secrecy = "0.10"

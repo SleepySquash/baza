@@ -11,8 +11,8 @@ use rusoto_s3::{
     Delete, DeleteObjectError, DeleteObjectRequest, DeleteObjectsError,
     DeleteObjectsOutput, DeleteObjectsRequest, GetObjectError,
     GetObjectRequest, HeadBucketError, HeadBucketRequest, HeadObjectError,
-    HeadObjectRequest, ObjectIdentifier, PutObjectError, PutObjectRequest,
-    S3 as _, S3Client,
+    HeadObjectRequest, ListObjectsRequest, ListObjectsV2Request,
+    ObjectIdentifier, PutObjectError, PutObjectRequest, S3 as _, S3Client,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -350,6 +350,173 @@ async fn not_implemented_error(w: &mut World) {
     }
 }
 
+#[given("the following objects were uploaded to a new bucket:")]
+async fn objects_uploaded_to_new_bucket(w: &mut World, step: &Step) {
+    let bucket = new_bucket(w);
+    for row in &step.table().expect("No data table present in the step").rows {
+        put_object(&bucket, &row[0], sample_file("rms.jpg"), None::<String>)
+            .await;
+    }
+}
+
+#[given(regex = "^`(\\S+)` symlink was created in the new bucket \
+                  pointing to `(\\S+)`$")]
+async fn symlink_created_in_new_bucket(
+    w: &mut World,
+    key: String,
+    original: String,
+) {
+    let bucket = new_bucket(w);
+    put_object(&bucket, key, &[], Some(format!("{bucket}/{original}"))).await;
+}
+
+#[given(regex = r"^`(\S+)` empty directory was created in the new bucket$")]
+async fn empty_dir_created_in_new_bucket(
+    w: &mut World,
+    path: String,
+) -> io::Result<()> {
+    let bucket = new_bucket(w);
+    async_fs::create_dir_all(format!("{DATA_DIR}/{bucket}/{path}")).await
+}
+
+#[given("the new bucket was created empty")]
+async fn new_bucket_created_empty(w: &mut World) -> io::Result<()> {
+    // There is no `CreateBucket` support, so it's created on disk directly.
+    async_fs::create_dir_all(format!("{DATA_DIR}/{}", new_bucket(w))).await
+}
+
+#[given(regex = r"^`(\S+)` was deleted from the new bucket$")]
+async fn deleted_from_new_bucket(w: &mut World, key: String) {
+    try_delete_object(new_bucket(w), key)
+        .await
+        .unwrap_or_else(|e| panic!("`DeleteObjectRequest` failed: {e}"));
+}
+
+#[when(regex = "^listing the new bucket with (ListObjects|ListObjectsV2)\
+                 (?: by prefix `(\\S+)`)?\
+                 (?: by delimiter `(\\S+)`)?\
+                 (?: by (\\d+) keys per page)?\
+                 ( with URL encoding)?$")]
+async fn listing_new_bucket(
+    w: &mut World,
+    op: String,
+    prefix: String,
+    delimiter: String,
+    max_keys: String,
+    url_encoding: String,
+) {
+    let params = ListParams {
+        bucket: new_bucket(w),
+        delimiter: (!delimiter.is_empty()).then_some(delimiter),
+        encoding_type: (!url_encoding.is_empty()).then(|| "url".into()),
+        max_keys: (!max_keys.is_empty())
+            .then(|| max_keys.parse().expect("Invalid number of keys")),
+        prefix: (!prefix.is_empty()).then_some(prefix),
+    };
+
+    w.list_objects_response = Some(if op == "ListObjects" {
+        list_objects(params).await
+    } else {
+        list_objects_v2(params).await
+    });
+}
+
+#[then("the following keys are listed:")]
+async fn keys_are_listed(w: &mut World, step: &Step) {
+    let expected = step
+        .table()
+        .expect("No data table present in the step")
+        .rows
+        .iter()
+        .map(|row| row[0].clone())
+        .collect::<Vec<_>>();
+    let actual = w
+        .last_listed_pages()
+        .iter()
+        .flat_map(|p| p.objects.iter().map(|o| o.key.clone()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual, expected);
+}
+
+#[then("the following common prefixes are listed:")]
+async fn common_prefixes_are_listed(w: &mut World, step: &Step) {
+    let expected = step
+        .table()
+        .expect("No data table present in the step")
+        .rows
+        .iter()
+        .map(|row| row[0].clone())
+        .collect::<Vec<_>>();
+    let actual = w
+        .last_listed_pages()
+        .iter()
+        .flat_map(|p| p.common_prefixes.iter().cloned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual, expected);
+}
+
+#[then(regex = r"^no (keys|common prefixes) are listed$")]
+async fn nothing_is_listed(w: &mut World, what: String) {
+    for page in w.last_listed_pages() {
+        if what == "keys" {
+            assert!(page.objects.is_empty(), "keys are listed: {page:#?}");
+        } else {
+            assert!(
+                page.common_prefixes.is_empty(),
+                "common prefixes are listed: {page:#?}",
+            );
+        }
+    }
+}
+
+#[then(regex = r"^it's listed in (\d+) pages?$")]
+async fn listed_in_pages(w: &mut World, count: usize) {
+    assert_eq!(w.last_listed_pages().len(), count, "number of pages");
+}
+
+#[then(regex = r"^`(\S+)` is listed with the size of `(\S+)`$")]
+async fn listed_with_size(w: &mut World, key: String, sample: String) {
+    let size = i64::try_from(sample_file(sample).len()).unwrap();
+
+    let obj = w.last_listed_object(&key);
+    assert_eq!(obj.size, Some(size), "`Size` mismatch");
+}
+
+#[then(regex = "^`(\\S+)` is listed with the same metadata as \
+                 `HeadObject` returns$")]
+async fn listed_with_head_object_metadata(w: &mut World, key: String) {
+    let obj = w.last_listed_object(&key).clone();
+
+    let req = HeadObjectRequest {
+        bucket: new_bucket(w),
+        key,
+        ..HeadObjectRequest::default()
+    };
+    let head = s3_client()
+        .head_object(req)
+        .await
+        .unwrap_or_else(|e| panic!("`HeadObjectRequest` failed: {e}"));
+
+    assert_eq!(obj.e_tag, head.e_tag, "`ETag` mismatch");
+    assert_eq!(obj.size, head.content_length, "`Size` mismatch");
+    let listed = obj.last_modified.as_deref().expect("No `LastModified`");
+    let listed = chrono::DateTime::parse_from_rfc3339(listed)
+        .unwrap_or_else(|e| panic!("Invalid `LastModified` `{listed}`: {e}"));
+    assert_eq!(
+        Some(httpdate::fmt_http_date(listed.into())),
+        head.last_modified,
+        "`LastModified` mismatch",
+    );
+}
+
+/// Returns the name of the bucket unique to the provided [`World`], which is
+/// not shared with other scenarios, so its listings are predictable.
+fn new_bucket(w: &World) -> String {
+    w.unique.filename("list")
+}
+
 /// Asserts that the provided sample file is stored at the provided `filename`
 /// in the [`DATA_DIR`].
 async fn assert_stored(
@@ -401,6 +568,146 @@ pub(super) struct ObjectMeta {
 
     /// `Last-Modified` time of the object.
     last_modified: Option<String>,
+}
+
+/// Pages of a full `ListObjects` or `ListObjectsV2` listing, in the order they
+/// were received.
+pub(super) type ListObjectsResponse = Result<Vec<ListedPage>, String>;
+
+/// Single page of a `ListObjects` or `ListObjectsV2` listing.
+#[derive(Clone, Debug)]
+pub(super) struct ListedPage {
+    /// Listed objects.
+    objects: Vec<ListedObject>,
+
+    /// Listed common prefixes.
+    common_prefixes: Vec<String>,
+}
+
+/// Object listed by `ListObjects` or `ListObjectsV2`.
+#[derive(Clone, Debug)]
+struct ListedObject {
+    /// Key of the object.
+    key: String,
+
+    /// `ETag` of the object.
+    e_tag: Option<String>,
+
+    /// `LastModified` time of the object.
+    last_modified: Option<String>,
+
+    /// Size of the object.
+    size: Option<i64>,
+}
+
+impl From<rusoto_s3::Object> for ListedObject {
+    fn from(obj: rusoto_s3::Object) -> Self {
+        Self {
+            key: obj.key.expect("No `Key` in `Contents`"),
+            e_tag: obj.e_tag,
+            last_modified: obj.last_modified,
+            size: obj.size,
+        }
+    }
+}
+
+/// Parameters of a `ListObjects` or `ListObjectsV2` listing.
+struct ListParams {
+    bucket: String,
+    delimiter: Option<String>,
+    encoding_type: Option<String>,
+    max_keys: Option<i64>,
+    prefix: Option<String>,
+}
+
+/// Maximum number of pages to request in a single listing, preventing infinite
+/// loops on broken pagination.
+const MAX_LIST_PAGES: usize = 100;
+
+/// Lists all the objects with `ListObjects`, following `NextMarker`s.
+async fn list_objects(params: ListParams) -> ListObjectsResponse {
+    let mut pages = vec![];
+    let mut marker = None;
+    while pages.len() < MAX_LIST_PAGES {
+        let req = ListObjectsRequest {
+            bucket: params.bucket.clone(),
+            delimiter: params.delimiter.clone(),
+            encoding_type: params.encoding_type.clone(),
+            marker: marker.take(),
+            max_keys: params.max_keys,
+            prefix: params.prefix.clone(),
+            ..ListObjectsRequest::default()
+        };
+        let out = s3_client()
+            .list_objects(req)
+            .await
+            .map_err(|e| format!("`ListObjectsRequest` failed: {e}"))?;
+
+        pages.push(ListedPage {
+            objects: out
+                .contents
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            common_prefixes: out
+                .common_prefixes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.prefix.expect("No `Prefix` in `CommonPrefixes`"))
+                .collect(),
+        });
+        if out.is_truncated != Some(true) {
+            return Ok(pages);
+        }
+        marker = Some(out.next_marker.ok_or("No `NextMarker` returned")?);
+    }
+    Err(format!("More than {MAX_LIST_PAGES} pages listed"))
+}
+
+/// Lists all the objects with `ListObjectsV2`, following
+/// `NextContinuationToken`s.
+async fn list_objects_v2(params: ListParams) -> ListObjectsResponse {
+    let mut pages = vec![];
+    let mut token = None;
+    while pages.len() < MAX_LIST_PAGES {
+        let req = ListObjectsV2Request {
+            bucket: params.bucket.clone(),
+            continuation_token: token.take(),
+            delimiter: params.delimiter.clone(),
+            encoding_type: params.encoding_type.clone(),
+            max_keys: params.max_keys,
+            prefix: params.prefix.clone(),
+            ..ListObjectsV2Request::default()
+        };
+        let out = s3_client()
+            .list_objects_v2(req)
+            .await
+            .map_err(|e| format!("`ListObjectsV2Request` failed: {e}"))?;
+
+        pages.push(ListedPage {
+            objects: out
+                .contents
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            common_prefixes: out
+                .common_prefixes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.prefix.expect("No `Prefix` in `CommonPrefixes`"))
+                .collect(),
+        });
+        if out.is_truncated != Some(true) {
+            return Ok(pages);
+        }
+        token = Some(
+            out.next_continuation_token
+                .ok_or("No `NextContinuationToken` returned")?,
+        );
+    }
+    Err(format!("More than {MAX_LIST_PAGES} pages listed"))
 }
 
 /// Response to a [`HeadBucketRequest`].
@@ -500,6 +807,36 @@ impl World {
     /// If there is no [`GetObjectResponse`] in this [`World`].
     fn last_get_object_response(&mut self) -> GetObjectResponse {
         self.get_object_response.take().expect("No `GetObjectResponse`")
+    }
+
+    /// Returns pages of the last successful [`ListObjectsResponse`], stored in
+    /// this [`World`].
+    ///
+    /// # Panics
+    ///
+    /// - If there is no [`ListObjectsResponse`] in this [`World`].
+    /// - If the [`ListObjectsResponse`] is an error.
+    fn last_listed_pages(&self) -> &[ListedPage] {
+        self.list_objects_response
+            .as_ref()
+            .expect("No `ListObjectsResponse`")
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Returns the [`ListedObject`] with the provided `key` from the last
+    /// successful [`ListObjectsResponse`], stored in this [`World`].
+    ///
+    /// # Panics
+    ///
+    /// - If there is no successful [`ListObjectsResponse`] in this [`World`].
+    /// - If there is no [`ListedObject`] with the provided `key` in it.
+    fn last_listed_object(&self, key: &str) -> &ListedObject {
+        self.last_listed_pages()
+            .iter()
+            .flat_map(|p| &p.objects)
+            .find(|o| o.key == key)
+            .unwrap_or_else(|| panic!("`{key}` is not listed"))
     }
 
     /// Returns the last successful [`DeleteObjectsResponse`], stored in this

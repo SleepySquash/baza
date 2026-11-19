@@ -2,19 +2,20 @@
 
 use std::{
     convert::Infallible,
-    fmt, io,
+    error, fmt, io,
     net::{TcpListener, ToSocketAddrs},
     time::UNIX_EPOCH,
 };
 
 use baza::{
-    CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, FileMeta,
-    GetFile, GetFileMeta, InvalidRelativePathError, ReadOnlyFile, RelativePath,
+    CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, FileList,
+    FileMeta, GetFile, GetFileMeta, ListFiles, ReadOnlyFile, RelativePath,
     async_trait, futures::future,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use derive_more::with_trait::{Display, Error, From};
 use hyper::{server::Server, service::make_service_fn};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
 use s3_server::{
     S3Service, S3Storage, SimpleAuth, dto,
     errors::{S3Error, S3ErrorCode, S3StorageError, S3StorageResult},
@@ -76,13 +77,14 @@ pub enum RunHttpServerError {
 pub struct S3<T>(T);
 
 #[async_trait]
-impl<S, E1, E2, E3, E4, E5> S3Storage for S3<S>
+impl<S, E1, E2, E3, E4, E5, E6> S3Storage for S3<S>
 where
     S: Exec<CreateFile<dto::ByteStream>, Err = E1>
         + Exec<CreateSymlink, Err = E2>
         + Exec<DeleteFile, Ok = (), Err = E3>
         + Exec<GetFile, Ok = Option<ReadOnlyFile>, Err = E4>
         + Exec<GetFileMeta, Ok = Option<FileMeta>, Err = E5>
+        + Exec<ListFiles, Ok = FileList, Err = E6>
         + fmt::Debug
         + Send
         + Sync
@@ -92,6 +94,7 @@ where
     E3: AsRef<DeleteFileError> + fmt::Display + Send,
     E4: fmt::Display,
     E5: fmt::Display,
+    E6: fmt::Display,
 {
     async fn complete_multipart_upload(
         &self,
@@ -142,7 +145,7 @@ where
         &self,
         input: dto::DeleteObjectRequest,
     ) -> S3StorageResult<dto::DeleteObjectOutput, dto::DeleteObjectError> {
-        let path = parse_s3_path(input.bucket, input.key)?;
+        let path = parse_uri_s3_path(input.bucket, &input.key)?;
 
         self.delete_file(path)
             .await
@@ -221,7 +224,7 @@ where
         &self,
         input: dto::GetObjectRequest,
     ) -> S3StorageResult<dto::GetObjectOutput, dto::GetObjectError> {
-        let path = parse_s3_path(input.bucket, input.key.clone())?;
+        let path = parse_uri_s3_path(input.bucket, &input.key)?;
 
         let file = self
             .0
@@ -261,7 +264,7 @@ where
         &self,
         input: dto::HeadObjectRequest,
     ) -> S3StorageResult<dto::HeadObjectOutput, dto::HeadObjectError> {
-        let path = parse_s3_path(input.bucket, input.key.clone())?;
+        let path = parse_uri_s3_path(input.bucket, &input.key)?;
 
         let meta = self
             .0
@@ -291,19 +294,111 @@ where
         Err(not_implemented("ListBuckets").into())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = input.bucket.as_str(),
+            delimiter = input.delimiter.as_deref(),
+            marker = input.marker.as_deref(),
+            prefix = input.prefix.as_deref(),
+        ),
+    )]
     async fn list_objects(
         &self,
-        _: dto::ListObjectsRequest,
+        input: dto::ListObjectsRequest,
     ) -> S3StorageResult<dto::ListObjectsOutput, dto::ListObjectsError> {
-        Err(not_implemented("ListObjects").into())
+        let encoding = KeyEncoding::parse(input.encoding_type.as_deref())?;
+        let op = list_files_op(
+            input.bucket.clone(),
+            input.prefix.clone(),
+            input.delimiter.clone(),
+            input.marker.clone(),
+            input.max_keys,
+        )?;
+        let max_keys = op.max_keys;
+
+        let mut list = self
+            .0
+            .exec(op)
+            .await
+            .map_err(|e| internal_error("ListFiles operation failed", e))?;
+        one_common_prefix_per_page(&mut list);
+        let (contents, common_prefixes) = list_entries(&list, encoding)?;
+
+        tracing::info!("OK");
+        Ok(dto::ListObjectsOutput {
+            // `s3_server` writes an empty `CommonPrefixes` element otherwise,
+            // which clients parse as a single common prefix without a value.
+            common_prefixes: (!common_prefixes.is_empty())
+                .then_some(common_prefixes),
+            contents: Some(contents),
+            delimiter: input.delimiter.map(|d| encoding.encode(&d)),
+            encoding_type: input.encoding_type,
+            is_truncated: Some(list.is_truncated),
+            marker: Some(encoding.encode(&input.marker.unwrap_or_default())),
+            max_keys: Some(max_keys.try_into().unwrap_or(i64::MAX)),
+            name: Some(input.bucket),
+            next_marker: list.next_start_after.map(|m| encoding.encode(&m)),
+            prefix: Some(encoding.encode(&input.prefix.unwrap_or_default())),
+        })
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = input.bucket.as_str(),
+            continuation_token = input.continuation_token.as_deref(),
+            delimiter = input.delimiter.as_deref(),
+            prefix = input.prefix.as_deref(),
+            start_after = input.start_after.as_deref(),
+        ),
+    )]
     async fn list_objects_v2(
         &self,
-        _: dto::ListObjectsV2Request,
+        input: dto::ListObjectsV2Request,
     ) -> S3StorageResult<dto::ListObjectsV2Output, dto::ListObjectsV2Error>
     {
-        Err(not_implemented("ListObjectsV2").into())
+        let encoding = KeyEncoding::parse(input.encoding_type.as_deref())?;
+        // Continuation token is just the last listed entry, so it always goes
+        // after the `start_after` provided along with it in the first request.
+        let op = list_files_op(
+            input.bucket.clone(),
+            input.prefix.clone(),
+            input.delimiter.clone(),
+            input.continuation_token.clone().or(input.start_after.clone()),
+            input.max_keys,
+        )?;
+        let max_keys = op.max_keys;
+
+        let mut list = self
+            .0
+            .exec(op)
+            .await
+            .map_err(|e| internal_error("ListFiles operation failed", e))?;
+        one_common_prefix_per_page(&mut list);
+        let (contents, common_prefixes) = list_entries(&list, encoding)?;
+        // TODO: `s3_server` writes `max_keys` as `KeyCount`, fix it once
+        //       migrated to `s3s`.
+        let key_count = contents.len() + common_prefixes.len();
+
+        tracing::info!("OK");
+        Ok(dto::ListObjectsV2Output {
+            // `s3_server` writes an empty `CommonPrefixes` element otherwise,
+            // which clients parse as a single common prefix without a value.
+            common_prefixes: (!common_prefixes.is_empty())
+                .then_some(common_prefixes),
+            contents: Some(contents),
+            continuation_token: input.continuation_token,
+            delimiter: input.delimiter.map(|d| encoding.encode(&d)),
+            encoding_type: input.encoding_type,
+            is_truncated: Some(list.is_truncated),
+            key_count: Some(key_count.try_into().unwrap_or(i64::MAX)),
+            max_keys: Some(max_keys.try_into().unwrap_or(i64::MAX)),
+            name: Some(input.bucket),
+            next_continuation_token: list.next_start_after,
+            prefix: Some(encoding.encode(&input.prefix.unwrap_or_default())),
+            start_after: input.start_after.map(|s| encoding.encode(&s)),
+        })
     }
 
     #[tracing::instrument(
@@ -314,7 +409,7 @@ where
         &self,
         input: dto::PutObjectRequest,
     ) -> S3StorageResult<dto::PutObjectOutput, dto::PutObjectError> {
-        let path = parse_s3_path(input.bucket, input.key)?;
+        let path = parse_uri_s3_path(input.bucket, &input.key)?;
 
         if let Some(original) =
             input.metadata.and_then(|mut meta| meta.remove(SYMLINK_META_KEY))
@@ -369,8 +464,8 @@ where
     }
 }
 
-/// Headers describing an S3 object, shared by [`dto::GetObjectOutput`] and
-/// [`dto::HeadObjectOutput`].
+/// Headers describing an S3 object, shared by [`dto::GetObjectOutput`],
+/// [`dto::HeadObjectOutput`] and [`dto::Object`].
 #[derive(Debug)]
 struct ObjectHeaders {
     /// Size of the object in bytes.
@@ -391,8 +486,9 @@ struct ObjectHeaders {
     /// content against it.
     e_tag: String,
 
-    /// Last modification time of the object, in [RFC 3339] format, as
-    /// [`s3_server`] expects.
+    /// Last modification time of the object, in [RFC 3339] format with
+    /// milliseconds and `Z` suffix (like `2009-10-12T17:50:30.000Z`), as
+    /// [`s3_server`] expects and S3 returns in object listings.
     ///
     /// [RFC 3339]: https://www.rfc-editor.org/rfc/rfc3339
     last_modified: String,
@@ -415,9 +511,177 @@ impl TryFrom<&FileMeta> for ObjectHeaders {
             content_length,
             content_type: "application/octet-stream".into(),
             e_tag: format!("\"{mtime:x}-{:x}\"", meta.size),
-            last_modified: DateTime::<Utc>::from(meta.modified).to_rfc3339(),
+            last_modified: DateTime::<Utc>::from(meta.modified)
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
         })
     }
+}
+
+/// Default (and maximum) number of keys returned by `ListObjects` and
+/// `ListObjectsV2`, as S3 does.
+const MAX_KEYS: usize = 1000;
+
+/// Constructs a [`ListFiles`] operation out of the provided `ListObjects` or
+/// `ListObjectsV2` request parameters.
+///
+/// # Errors
+///
+/// - If the `bucket` is not a valid [`RelativePath`].
+/// - If the `max_keys` is negative.
+fn list_files_op(
+    bucket: String,
+    prefix: Option<String>,
+    delimiter: Option<String>,
+    start_after: Option<String>,
+    max_keys: Option<i64>,
+) -> Result<ListFiles, S3Error> {
+    let max_keys = max_keys.map_or(Ok(MAX_KEYS), |n| {
+        usize::try_from(n).map(|n| n.min(MAX_KEYS)).map_err(|_| {
+            S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                "`max-keys` cannot be negative",
+            )
+        })
+    })?;
+
+    Ok(ListFiles {
+        bucket: parse_relative_path("bucket", bucket)?,
+        prefix: prefix.unwrap_or_default(),
+        delimiter,
+        start_after,
+        max_keys,
+    })
+}
+
+/// Truncates the provided [`FileList`] right before its second common prefix
+/// (if any), so it contains at most one.
+///
+/// [`s3_server`] serializes all the `CommonPrefixes` into a single XML element,
+/// rather than one element per common prefix, as S3 does, so clients see only
+/// one of them. Listing at most one common prefix per page keeps listings
+/// correct, just split into more pages, because S3 allows returning fewer
+/// entries than `max-keys`.
+// TODO: Remove once migrated to `s3s`.
+fn one_common_prefix_per_page(list: &mut FileList) {
+    if list.common_prefixes.len() < 2 {
+        return;
+    }
+    let second = list.common_prefixes.swap_remove(1);
+    list.common_prefixes.truncate(1);
+
+    // Both files and common prefixes are sorted, so the files listed before
+    // the second common prefix are the ones less than it.
+    let len = list.files.partition_point(|f| f.key < second);
+    list.files.truncate(len);
+
+    list.is_truncated = true;
+    list.next_start_after = list
+        .files
+        .last()
+        .map(|f| &f.key)
+        .max(list.common_prefixes.first())
+        .cloned();
+}
+
+/// Converts the provided [`FileList`] into `Contents` and `CommonPrefixes` of a
+/// `ListObjects` or `ListObjectsV2` response, encoding them with the provided
+/// [`KeyEncoding`].
+///
+/// # Errors
+///
+/// If any of the listed files cannot be represented as [`ObjectHeaders`].
+fn list_entries(
+    list: &FileList,
+    encoding: KeyEncoding,
+) -> Result<(Vec<dto::Object>, Vec<rusoto_s3::CommonPrefix>), S3Error> {
+    let contents = list
+        .files
+        .iter()
+        .map(|file| {
+            let headers = ObjectHeaders::try_from(&file.meta)?;
+            Ok(dto::Object {
+                e_tag: Some(headers.e_tag),
+                key: Some(encoding.encode(&file.key)),
+                last_modified: Some(headers.last_modified),
+                size: Some(headers.content_length),
+                storage_class: Some("STANDARD".into()),
+                ..dto::Object::default()
+            })
+        })
+        .collect::<Result<_, S3Error>>()?;
+    let common_prefixes = list
+        .common_prefixes
+        .iter()
+        .map(|p| rusoto_s3::CommonPrefix { prefix: Some(encoding.encode(p)) })
+        .collect();
+
+    Ok((contents, common_prefixes))
+}
+
+/// Encoding of object keys in `ListObjects` and `ListObjectsV2` responses,
+/// requested via their `encoding-type` parameter.
+#[derive(Clone, Copy, Debug)]
+enum KeyEncoding {
+    /// Keys are returned as is.
+    None,
+
+    /// Keys are URL-encoded (`encoding-type=url`).
+    Url,
+}
+
+impl KeyEncoding {
+    /// Characters to be URL-encoded: everything except unreserved ones (as per
+    /// [RFC 3986]) and `/`, like S3 does.
+    ///
+    /// [RFC 3986]: https://www.rfc-editor.org/rfc/rfc3986#section-2.3
+    const URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'/')
+        .remove(b'_')
+        .remove(b'~');
+
+    /// Parses the provided `encoding-type` request parameter.
+    ///
+    /// # Errors
+    ///
+    /// If the `encoding-type` is neither absent, nor `url`.
+    fn parse(encoding_type: Option<&str>) -> Result<Self, S3Error> {
+        match encoding_type {
+            None => Ok(Self::None),
+            Some(t) if t.eq_ignore_ascii_case("url") => Ok(Self::Url),
+            Some(t) => Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                format!("Invalid `encoding-type`: {t}"),
+            )),
+        }
+    }
+
+    /// Encodes the provided object key (or prefix) with this [`KeyEncoding`].
+    fn encode(self, key: &str) -> String {
+        match self {
+            Self::None => key.to_owned(),
+            Self::Url => {
+                percent_encoding::utf8_percent_encode(key, Self::URL_ENCODE_SET)
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Parses the provided `bucket` and percent-encoded `key` (as they're taken
+/// from a request URI path) into a single [`RelativePath`].
+///
+/// [`s3_server`] doesn't decode object keys taken from request URI paths, so
+/// they're decoded here.
+fn parse_uri_s3_path(
+    bucket: String,
+    key: &str,
+) -> Result<RelativePath, InvalidArgument> {
+    let key = percent_encoding::percent_decode_str(key)
+        .decode_utf8()
+        .map_err(|e| InvalidArgument { attr: "key", err: Box::new(e) })?;
+    parse_s3_path(bucket, key.into_owned())
 }
 
 /// Parses the provided `bucket` and `key` into a single [`RelativePath`].
@@ -434,10 +698,11 @@ fn parse_relative_path(
     attr: &'static str,
     s: String,
 ) -> Result<RelativePath, InvalidArgument> {
-    s.try_into().map_err(|err| InvalidArgument { attr, err })
+    s.try_into().map_err(|err| InvalidArgument { attr, err: Box::new(err) })
 }
 
-/// Invalid [`RelativePath`] provided as the `attr` of a request.
+/// Invalid [`RelativePath`] (or a key not decodable into one) provided as the
+/// `attr` of a request.
 ///
 /// Converts into a [`S3ErrorCode::InvalidArgument`] [`S3Error`].
 #[derive(Debug, Display)]
@@ -446,8 +711,9 @@ struct InvalidArgument {
     /// Name of the invalid request attribute.
     attr: &'static str,
 
-    /// Error of parsing the [`RelativePath`].
-    err: InvalidRelativePathError,
+    /// Error of parsing the [`RelativePath`] (usually an
+    /// [`InvalidRelativePathError`](baza::InvalidRelativePathError)).
+    err: Box<dyn error::Error + Send + Sync>,
 }
 
 impl From<InvalidArgument> for S3Error {

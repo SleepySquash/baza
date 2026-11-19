@@ -14,6 +14,7 @@ publish = false
 async-fs = "2.2"
 baza = { package = "baza-lib", path = "../lib" }
 baza-api-s3 = { path = "../api/s3" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 cucumber = { version = "0.22", features = ["libtest"] }
 httpdate = "1"
 rand = "0.9"

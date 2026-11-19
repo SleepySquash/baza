@@ -236,6 +236,7 @@ dependencies = [
  "chrono",
  "derive_more",
  "hyper",
+ "percent-encoding",
  "rusoto_s3 0.47.0",
  "s3-server",
  "secrecy",
@@ -250,6 +251,7 @@ dependencies = [
  "async-fs 2.2.0",
  "baza-api-s3",
  "baza-lib",
+ "chrono",
  "cucumber",
  "httpdate",
  "rand",
@@ -265,6 +267,7 @@ version = "0.0.0"
 dependencies = [
  "async-fs 2.2.0",
  "async-trait",
+ "blocking",
  "derive_more",
  "futures",
  "tracerr",
