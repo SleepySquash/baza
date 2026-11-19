@@ -181,10 +181,53 @@ where
 /// - If the parent directories of the `dest` path cannot be created.
 /// - If [`async_fs::rename()`] fails.
 async fn move_file(src: &Path, dest: &Path) -> Result<(), Traced<io::Error>> {
-    if let Some(dir) = dest.parent() {
-        async_fs::create_dir_all(dir).await.map_err(tracerr::wrap!())?;
+    in_parent_dir(dest, || async_fs::rename(src, dest))
+        .await
+        .map_err(tracerr::wrap!())
+}
+
+/// Maximum number of attempts [`in_parent_dir()`] makes.
+const MAX_PARENT_DIR_ATTEMPTS: usize = 3;
+
+/// Creates all the missing parent directories of the provided `path`, and then
+/// executes the provided `op`eration, which is expected to create something at
+/// this `path`.
+///
+/// [`DeleteFile`] prunes empty directories concurrently, so the parent
+/// directories may be removed right after being created. That's why the whole
+/// thing is retried (up to [`MAX_PARENT_DIR_ATTEMPTS`] times) if either step
+/// fails with [`io::ErrorKind::NotFound`].
+///
+/// # Errors
+///
+/// - If the parent directories of the `path` cannot be created.
+/// - If the provided `op`eration fails.
+async fn in_parent_dir<F, Fut>(path: &Path, mut op: F) -> io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        let res = async {
+            if let Some(dir) = path.parent() {
+                async_fs::create_dir_all(dir).await?;
+            }
+            op().await
+        }
+        .await;
+
+        match res {
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    && attempt < MAX_PARENT_DIR_ATTEMPTS =>
+            {
+                tracing::debug!("Parent directory was pruned, retrying: {e}");
+                attempt += 1;
+            }
+            res => return res,
+        }
     }
-    async_fs::rename(src, dest).await.map_err(tracerr::wrap!())
 }
 
 /// Operation of a symlink creation.
@@ -206,13 +249,12 @@ impl Exec<CreateSymlink> for Storage {
     #[tracing::instrument(level = "debug", err(Debug))]
     async fn exec(&self, op: CreateSymlink) -> Result<Self::Ok, Self::Err> {
         let dest = self.data_dir.join(op.dest);
-        if let Some(dir) = dest.parent() {
-            async_fs::create_dir_all(dir).await.map_err(tracerr::wrap!())?;
-        }
         let src = self.data_dir.join(op.src);
 
-        match async_fs::unix::symlink(&src, &dest).await {
-            Ok(_) => return Ok(()),
+        match in_parent_dir(&dest, || async_fs::unix::symlink(&src, &dest))
+            .await
+        {
+            Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(tracerr::new!(e)),
         }
@@ -223,8 +265,127 @@ impl Exec<CreateSymlink> for Storage {
         // 2. replace the original file with the temporary one.
         let tmp = self.tmp_dir.join(Uuid::new_v4().to_string());
         async_fs::unix::symlink(src, &tmp).await.map_err(tracerr::wrap!())?;
-        async_fs::rename(&tmp, dest).await.map_err(tracerr::wrap!())
+        let res = move_file(&tmp, &dest).await;
+        if res.is_err() {
+            // Best-effort cleanup, the original error is more important.
+            drop(async_fs::remove_file(&tmp).await);
+        }
+        res
     }
+}
+
+/// Operation of an existing file deletion.
+///
+/// # Idempotent
+///
+/// Succeeds if there is no file at the [`DeleteFile::path`] already.
+///
+/// # Symlinks
+///
+/// If the [`DeleteFile::path`] is a symlink, then only the symlink itself is
+/// removed, while the file it points to stays intact.
+///
+/// Deleting a file doesn't touch symlinks pointing to it, so they become
+/// dangling, and [`GetFile`] returns [`None`] for them.
+///
+/// # Empty directories
+///
+/// Once the file is removed, its parent directories that became empty are
+/// removed too, up to (but not including) the data directory of the
+/// [`Storage`]. This is done on a best-effort basis: the first non-empty
+/// directory stops it, and errors caused by concurrent operations are ignored.
+#[derive(Clone, Debug)]
+pub struct DeleteFile {
+    /// [`RelativePath`] of the file to be deleted.
+    pub path: RelativePath,
+}
+
+#[async_trait]
+impl Exec<DeleteFile> for Storage {
+    type Ok = ();
+    type Err = Traced<DeleteFileError>;
+
+    #[allow(clippy::blocks_in_conditions)] // due to `instrument` attribute
+    #[tracing::instrument(level = "debug", err(Debug))]
+    async fn exec(&self, op: DeleteFile) -> Result<Self::Ok, Self::Err> {
+        let path = self.data_dir.join(op.path);
+
+        match async_fs::remove_file(&path).await {
+            Ok(()) => {}
+            // `NotADirectory` means that some parent of the `path` is a file,
+            // so there is no file at the `path` either.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory,
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => {
+                // Depending on the platform, removing a directory fails with
+                // different errors, so check it explicitly.
+                let is_dir = async_fs::symlink_metadata(&path)
+                    .await
+                    .is_ok_and(|m| m.is_dir());
+                return Err(tracerr::new!(if is_dir {
+                    DeleteFileError::IsDirectory
+                } else {
+                    DeleteFileError::Io(e)
+                }));
+            }
+        }
+
+        self.prune_empty_dirs(&path).await;
+        Ok(())
+    }
+}
+
+impl Storage {
+    /// Removes empty parent directories of the provided `path`, up to (but not
+    /// including) the [`Storage::data_dir`].
+    ///
+    /// Stops at the first non-empty directory. Never fails, because the file
+    /// at the `path` is removed already, and concurrent operations may create
+    /// or remove the same directories at any moment.
+    async fn prune_empty_dirs(&self, path: &Path) {
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| {
+            d.starts_with(&self.data_dir) && *d != self.data_dir.as_path()
+        }) {
+            match async_fs::remove_dir(d).await {
+                Ok(()) => {}
+                // Already removed by a concurrent operation.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to prune `{}` directory: {e}",
+                        d.display(),
+                    );
+                    break;
+                }
+            }
+            dir = d.parent();
+        }
+    }
+}
+
+/// Error of executing a [`DeleteFile`] operation.
+#[derive(Debug, Display, Error)]
+pub enum DeleteFileError {
+    /// [`DeleteFile::path`] is a directory, not a file.
+    ///
+    /// In S3 terms it's a prefix of other objects, rather than an object
+    /// itself, so the directory is left intact.
+    #[display("Path is a directory")]
+    IsDirectory,
+
+    /// Failed to remove the file.
+    #[display("Failed to remove file: {_0}")]
+    Io(io::Error),
 }
 
 /// Operation for getting an existing file.
@@ -313,19 +474,20 @@ impl TryFrom<String> for RelativePath {
 pub struct InvalidRelativePathError;
 
 #[cfg(test)]
-mod create_file_spec {
-    use std::{env, io, path::PathBuf};
+mod spec_util {
+    use std::{env, path::PathBuf};
 
-    use futures::{executor::block_on, stream};
     use uuid::Uuid;
 
-    use super::{CreateFile, Exec as _, RelativePath, Storage};
+    use super::RelativePath;
 
     /// Temporary [`Storage`] root, removed on [`Drop`].
-    struct Root(PathBuf);
+    ///
+    /// [`Storage`]: super::Storage
+    pub(super) struct Root(pub(super) PathBuf);
 
     impl Root {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self(env::temp_dir().join(format!("baza-{}", Uuid::new_v4())))
         }
     }
@@ -336,13 +498,25 @@ mod create_file_spec {
         }
     }
 
-    fn path(s: &str) -> RelativePath {
+    pub(super) fn path(s: &str) -> RelativePath {
         RelativePath::try_from(s.to_owned()).unwrap()
     }
 
-    fn tmp_is_empty(root: &Root) -> bool {
+    pub(super) fn tmp_is_empty(root: &Root) -> bool {
         std::fs::read_dir(root.0.join("tmp")).unwrap().next().is_none()
     }
+}
+
+#[cfg(test)]
+mod create_file_spec {
+    use std::io;
+
+    use futures::{executor::block_on, stream};
+
+    use super::{
+        CreateFile, Exec as _, Storage,
+        spec_util::{Root, path, tmp_is_empty},
+    };
 
     #[test]
     fn writes_file() {
@@ -408,6 +582,170 @@ mod create_file_spec {
         let stored = std::fs::read(root.0.join("data/bucket/key")).unwrap();
         assert_eq!(stored, b"original");
         assert!(tmp_is_empty(&root), "`tmp/` is not empty");
+    }
+}
+
+#[cfg(test)]
+mod delete_file_spec {
+    use std::fs;
+
+    use futures::{executor::block_on, stream};
+
+    use super::{
+        CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec as _,
+        GetFile, Storage,
+        spec_util::{Root, path},
+    };
+
+    async fn create(storage: &Storage, p: &str) {
+        let bytes = stream::iter([Ok(b"bytes".to_vec())]);
+        storage.exec(CreateFile { path: path(p), bytes }).await.unwrap();
+    }
+
+    #[test]
+    fn deletes_file_and_prunes_empty_dirs() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/a/b/key").await;
+
+            storage.exec(DeleteFile { path: path("bucket/a/b/key") }).await
+        })
+        .unwrap();
+
+        assert!(!root.0.join("data/bucket").exists(), "empty dirs are left");
+        assert!(root.0.join("data").is_dir(), "`data/` is removed");
+    }
+
+    #[test]
+    fn stops_pruning_at_non_empty_dir() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/a/b/key").await;
+            create(&storage, "bucket/a/other").await;
+
+            storage.exec(DeleteFile { path: path("bucket/a/b/key") }).await
+        })
+        .unwrap();
+
+        assert!(!root.0.join("data/bucket/a/b").exists(), "empty dir is left");
+        assert!(root.0.join("data/bucket/a/other").is_file());
+    }
+
+    #[test]
+    fn succeeds_on_missing_file() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/file").await;
+
+            for p in ["bucket/missing", "missing/key", "bucket/file/key"] {
+                storage.exec(DeleteFile { path: path(p) }).await.unwrap();
+            }
+        });
+
+        assert!(root.0.join("data/bucket/file").is_file());
+    }
+
+    #[test]
+    fn leaves_directory_intact() {
+        let root = Root::new();
+        let res = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/dir/key").await;
+
+            storage.exec(DeleteFile { path: path("bucket/dir") }).await
+        });
+
+        assert!(
+            matches!(
+                res.map_err(tracerr::Traced::into_inner),
+                Err(DeleteFileError::IsDirectory),
+            ),
+            "expected `DeleteFileError::IsDirectory`",
+        );
+        assert!(root.0.join("data/bucket/dir/key").is_file());
+    }
+
+    #[test]
+    fn deletes_only_symlink_itself() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/target").await;
+            storage
+                .exec(CreateSymlink {
+                    src: path("bucket/target"),
+                    dest: path("links/link"),
+                })
+                .await
+                .unwrap();
+
+            storage.exec(DeleteFile { path: path("links/link") }).await
+        })
+        .unwrap();
+
+        assert!(fs::symlink_metadata(root.0.join("data/links/link")).is_err());
+        assert_eq!(
+            fs::read(root.0.join("data/bucket/target")).unwrap(),
+            b"bytes"
+        );
+    }
+
+    #[test]
+    fn leaves_dangling_symlink_on_target_deletion() {
+        let root = Root::new();
+        let file = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/target").await;
+            storage
+                .exec(CreateSymlink {
+                    src: path("bucket/target"),
+                    dest: path("links/link"),
+                })
+                .await
+                .unwrap();
+
+            storage
+                .exec(DeleteFile { path: path("bucket/target") })
+                .await
+                .unwrap();
+            storage.exec(GetFile { path: path("links/link") }).await.unwrap()
+        });
+
+        assert!(file.is_none(), "dangling symlink is readable");
+        assert!(
+            fs::symlink_metadata(root.0.join("data/links/link"))
+                .unwrap()
+                .is_symlink(),
+            "symlink is removed",
+        );
+    }
+
+    #[test]
+    fn recreates_pruned_parent_dirs() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/a/key").await;
+            storage
+                .exec(DeleteFile { path: path("bucket/a/key") })
+                .await
+                .unwrap();
+
+            create(&storage, "bucket/a/key").await;
+            storage
+                .exec(CreateSymlink {
+                    src: path("bucket/a/key"),
+                    dest: path("links/a/link"),
+                })
+                .await
+                .unwrap();
+        });
+
+        assert!(root.0.join("data/bucket/a/key").is_file());
+        assert!(root.0.join("data/links/a/link").is_file());
     }
 }
 

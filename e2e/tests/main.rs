@@ -23,6 +23,9 @@ struct World {
     /// S3 object keys to check for validity.
     keys_to_check: HashSet<String>,
 
+    /// Latest [`s3::DeleteObjectsResponse`] (if any).
+    delete_objects_response: Option<s3::DeleteObjectsResponse>,
+
     /// Latest [`s3::GetObjectResponse`] (if any).
     get_object_response: Option<s3::GetObjectResponse>,
 

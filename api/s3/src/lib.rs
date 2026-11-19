@@ -7,8 +7,9 @@ use std::{
 };
 
 use baza::{
-    CreateFile, CreateSymlink, Exec, GetFile, ReadOnlyFile, RelativePath,
-    async_trait, futures::future,
+    CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, GetFile,
+    InvalidRelativePathError, ReadOnlyFile, RelativePath, async_trait,
+    futures::future,
 };
 use derive_more::with_trait::{Display, Error, From};
 use hyper::{server::Server, service::make_service_fn};
@@ -73,18 +74,20 @@ pub enum RunHttpServerError {
 pub struct S3<T>(T);
 
 #[async_trait]
-impl<S, E1, E2, E3> S3Storage for S3<S>
+impl<S, E1, E2, E3, E4> S3Storage for S3<S>
 where
     S: Exec<CreateFile<dto::ByteStream>, Err = E1>
         + Exec<CreateSymlink, Err = E2>
-        + Exec<GetFile, Ok = Option<ReadOnlyFile>, Err = E3>
+        + Exec<DeleteFile, Ok = (), Err = E3>
+        + Exec<GetFile, Ok = Option<ReadOnlyFile>, Err = E4>
         + fmt::Debug
         + Send
         + Sync
         + 'static,
     E1: fmt::Display,
     E2: fmt::Display,
-    E3: fmt::Display,
+    E3: AsRef<DeleteFileError> + fmt::Display + Send,
+    E4: fmt::Display,
 {
     async fn complete_multipart_upload(
         &self,
@@ -127,19 +130,73 @@ where
         Err(not_implemented("DeleteBucket").into())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(bucket = input.bucket.as_str(), key = input.key.as_str()),
+    )]
     async fn delete_object(
         &self,
-        _: dto::DeleteObjectRequest,
+        input: dto::DeleteObjectRequest,
     ) -> S3StorageResult<dto::DeleteObjectOutput, dto::DeleteObjectError> {
-        Err(not_implemented("DeleteObject").into())
+        let path = parse_s3_path(input.bucket, input.key)?;
+
+        self.delete_file(path)
+            .await
+            .map_err(|e| internal_error("DeleteFile operation failed", e))?;
+
+        tracing::info!("OK");
+        Ok(dto::DeleteObjectOutput::default())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            bucket = input.bucket.as_str(),
+            count = input.delete.objects.len(),
+        ),
+    )]
     async fn delete_objects(
         &self,
-        _: dto::DeleteObjectsRequest,
+        input: dto::DeleteObjectsRequest,
     ) -> S3StorageResult<dto::DeleteObjectsOutput, dto::DeleteObjectsError>
     {
-        Err(not_implemented("DeleteObjects").into())
+        let quiet = input.delete.quiet.unwrap_or_default();
+
+        let (mut deleted, mut errors) = (vec![], vec![]);
+        for obj in input.delete.objects {
+            let res = match parse_s3_path(input.bucket.clone(), obj.key.clone())
+            {
+                Ok(path) => self.delete_file(path).await.map_err(|e| {
+                    (
+                        S3ErrorCode::InternalError,
+                        format!("DeleteFile operation failed: {e}"),
+                    )
+                }),
+                Err(e) => Err((S3ErrorCode::InvalidArgument, e.to_string())),
+            };
+            match res {
+                // Quiet mode reports only errors.
+                Ok(()) if quiet => {}
+                Ok(()) => deleted.push(dto::DeletedObject {
+                    key: Some(obj.key),
+                    version_id: obj.version_id,
+                    ..dto::DeletedObject::default()
+                }),
+                Err((code, msg)) => errors.push(rusoto_s3::S3Error {
+                    code: Some(code.as_static_str().to_owned()),
+                    key: Some(obj.key),
+                    message: Some(msg),
+                    version_id: obj.version_id,
+                }),
+            }
+        }
+
+        tracing::info!("OK");
+        Ok(dto::DeleteObjectsOutput {
+            deleted: Some(deleted),
+            errors: Some(errors),
+            ..dto::DeleteObjectsOutput::default()
+        })
     }
 
     async fn get_bucket_location(
@@ -261,20 +318,64 @@ where
     }
 }
 
+impl<S, E> S3<S>
+where
+    S: Exec<DeleteFile, Ok = (), Err = E>,
+    E: AsRef<DeleteFileError> + fmt::Display,
+{
+    /// Executes the [`DeleteFile`] operation, treating a directory (which is a
+    /// prefix of other objects in S3 terms, rather than an object itself) at
+    /// the provided `path` as a missing object, so as a success, like S3 does.
+    async fn delete_file(&self, path: RelativePath) -> Result<(), E> {
+        match self.0.exec(DeleteFile { path }).await {
+            Err(e) if matches!(e.as_ref(), DeleteFileError::IsDirectory) => {
+                Ok(())
+            }
+            res => res,
+        }
+    }
+}
+
 /// Parses the provided `bucket` and `key` into a single [`RelativePath`].
-fn parse_s3_path(bucket: String, key: String) -> Result<RelativePath, S3Error> {
+fn parse_s3_path(
+    bucket: String,
+    key: String,
+) -> Result<RelativePath, InvalidArgument> {
     Ok(parse_relative_path("bucket", bucket)?
         .join(parse_relative_path("key", key)?))
 }
 
 /// Parses the provided [`String`] into a [`RelativePath`].
-fn parse_relative_path(attr: &str, s: String) -> Result<RelativePath, S3Error> {
-    s.try_into().map_err(|e| {
-        S3Error::new(
-            S3ErrorCode::InvalidArgument,
-            format!("Invalid {attr}: {e}"),
-        )
-    })
+fn parse_relative_path(
+    attr: &'static str,
+    s: String,
+) -> Result<RelativePath, InvalidArgument> {
+    s.try_into().map_err(|err| InvalidArgument { attr, err })
+}
+
+/// Invalid [`RelativePath`] provided as the `attr` of a request.
+///
+/// Converts into a [`S3ErrorCode::InvalidArgument`] [`S3Error`].
+#[derive(Debug, Display)]
+#[display("Invalid {attr}: {err}")]
+struct InvalidArgument {
+    /// Name of the invalid request attribute.
+    attr: &'static str,
+
+    /// Error of parsing the [`RelativePath`].
+    err: InvalidRelativePathError,
+}
+
+impl From<InvalidArgument> for S3Error {
+    fn from(e: InvalidArgument) -> Self {
+        Self::new(S3ErrorCode::InvalidArgument, e.to_string())
+    }
+}
+
+impl<E> From<InvalidArgument> for S3StorageError<E> {
+    fn from(e: InvalidArgument) -> Self {
+        S3Error::from(e).into()
+    }
 }
 
 /// Constructs a [`S3ErrorCode::NotImplemented`] [`S3Error`] for the provided

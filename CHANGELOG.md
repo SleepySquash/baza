@@ -11,6 +11,11 @@ All user visible changes to this project will be documented in this file. This p
 
 [Diff](/../../compare/v0.2.0...main)
 
+### Added
+
+- [S3 API]:
+    - `DeleteObject` and `DeleteObjects` methods (deleting a symlink removes only the symlink itself, and empty parent directories are removed).
+
 ### Changed
 
 - Deployment:
