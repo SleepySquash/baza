@@ -2,7 +2,7 @@ Baza
 ====
 
 [![CI](https://github.com/SleepySquash/baza/actions/workflows/ci.yml/badge.svg?branch=main "CI")](https://github.com/SleepySquash/baza/actions?query=workflow%3ACI+branch%3Amain)
-[![Rust 1.85+](https://img.shields.io/badge/rustc-1.85+-lightgray.svg "Rust 1.85+")](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![Rust 1.96+](https://img.shields.io/badge/rustc-1.96+-lightgray.svg "Rust 1.96+")](https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/)
 
 [GitHub Container Registry](https://github.com/SleepySquash/baza/pkgs/container/baza)
 

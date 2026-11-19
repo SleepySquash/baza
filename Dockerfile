@@ -2,9 +2,9 @@
 # Stage `dist` creates project distribution.
 #
 
-# https://github.com/instrumentisto/rust-docker-image/pkgs/container/rust
+# https://hub.docker.com/_/rust
 ARG rust_ver=latest
-FROM ghcr.io/instrumentisto/rust:${rust_ver} AS dist
+FROM docker.io/library/rust:${rust_ver} AS dist
 ARG rustc_mode=release
 ARG rustc_opts=--release
 

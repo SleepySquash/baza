@@ -2,7 +2,7 @@
 name = "baza-e2e"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 description = "E2E (end-to-end) tests of this project."
 authors = ["Instrumentisto Team <developer@instrumentisto.com>"]
 license = "BlueOak-1.0.0"
@@ -15,9 +15,9 @@ async-fs = "2.2"
 baza = { package = "baza-lib", path = "../lib" }
 baza-api-s3 = { path = "../api/s3" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-cucumber = { version = "0.22", features = ["libtest"] }
+cucumber = { version = "0.23", features = ["libtest"] }
 httpdate = "1"
-rand = "0.9"
+rand = "0.10"
 rusoto_core = "0.48"
 rusoto_credential = "0.48"
 rusoto_s3 = "0.48"

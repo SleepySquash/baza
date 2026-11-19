@@ -14,7 +14,7 @@ An S3 object `bucket/key` is stored as `<root>/data/<bucket>/<key>`. There's no 
 
 - `src/main.rs`: `baza` binary, the CLI (`clap`).
 - `lib/src/lib.rs`: `baza-lib` (imported as `baza`), the filesystem storage. Each operation is a struct with an `impl Exec<Op> for Storage`. Build paths only through `RelativePath`, which prevents path traversal.
-- `api/s3/src/lib.rs`: `baza-api-s3`, `S3<T>` implementing `s3_server::S3Storage` (`s3-server` 0.2, `hyper` 0.14).
+- `api/s3/src/lib.rs`: `baza-api-s3`, `S3<T>` implementing `s3s::S3` (`s3s` 0.17, `hyper` 1). Unimplemented methods fall back to `s3s`' default `NotImplemented`.
 - `e2e/`: Cucumber tests using `rusoto_s3` against a server on `localhost:9294`. They inspect `.cache/baza/data` directly.
 - `helm/baza/`: Helm chart.
 
@@ -41,7 +41,7 @@ make test.unit
 make test.e2e start-app=yes   # builds, starts Baza, runs Cucumber, stops it
 ```
 
-CI pins Rust via `RUST_VER` in `.github/workflows/ci.yml`. Single E2E scenario: `make test.e2e start-app=yes only='<regex>'`.
+CI pins Rust via `RUST_VER` in `.github/workflows/ci.yml` (1.99); MSRV is 1.96 (required by `s3s`). Single E2E scenario: `make test.e2e start-app=yes only='<regex>'`.
 
 
 

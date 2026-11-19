@@ -11,17 +11,24 @@ All user visible changes to this project will be documented in this file. This p
 
 [Diff](/../../compare/v0.2.0...main)
 
+### BC Breaks
+
+- Minimal supported Rust version is 1.96 now (was 1.85), as required by [`s3s`].
+
 ### Added
 
 - [S3 API]:
     - `DeleteObject` and `DeleteObjects` methods (deleting a symlink removes only the symlink itself, and empty parent directories are removed).
     - `HeadObject` method (a symlink reports the metadata of the object it points to).
     - `Content-Length`, `Content-Type`, `ETag` and `Last-Modified` headers to `GetObject` responses (`ETag` is derived from the object's size and modification time, rather than being an MD5 digest of its content, and `Content-Type` is always `application/octet-stream`).
-    - `ListObjects` and `ListObjectsV2` methods, supporting `prefix`, `delimiter`, `max-keys`, `marker`/`start-after`/`continuation-token` pagination and `encoding-type=url` (symlinks are listed with the metadata of the objects they point to, dangling symlinks are skipped, a missing bucket is listed as an empty one, and at most one common prefix is returned per page).
+    - `ListObjects` and `ListObjectsV2` methods, supporting `prefix`, `delimiter`, `max-keys`, `marker`/`start-after`/`continuation-token` pagination and `encoding-type=url` (symlinks are listed with the metadata of the objects they point to, dangling symlinks are skipped, and a missing bucket is listed as an empty one).
 
 ### Changed
 
+- [S3 API]:
+    - Switched S3 protocol implementation from unmaintained [`s3-server`] to [`s3s`] 0.17, and HTTP server from [`hyper`] 0.14 to [`hyper`] 1 (also serving HTTP/2 now).
 - Deployment:
+    - [Docker] image is built from the official `rust` image, instead of `ghcr.io/instrumentisto/rust`.
     - [Docker] image is published to `ghcr.io/sleepysquash/baza` only.
 
 ### Fixed
@@ -32,6 +39,8 @@ All user visible changes to this project will be documented in this file. This p
     - `PutObject` of a regular file over an existing symlink writing through to the symlink's target instead of replacing the symlink.
     - `GetObject` of a key that is a prefix of other objects (a directory on disk) failing instead of returning a `NoSuchKey` error.
     - Object keys with URL-encoded characters (like spaces) being stored in their URL-encoded form (`a%20b` instead of `a b`).
+    - Signature verification failing with `403` for some keys with URL-encoded characters (like `HeadObject` of a key with a space, sent by `aws-sdk-go-v2`).
+    - `ListObjects` and `ListObjectsV2` returning all `CommonPrefixes` in a single XML element, and `ListObjectsV2` returning `max-keys` as `KeyCount`.
 
 
 
@@ -84,6 +93,9 @@ All user visible changes to this project will be documented in this file. This p
 
 [CLI]: https://en.wikipedia.org/wiki/Command-line_interface
 [Docker]: https://www.docker.com
+[`hyper`]: https://docs.rs/hyper
+[`s3-server`]: https://docs.rs/s3-server
+[`s3s`]: https://docs.rs/s3s
 [Helm]: https://helm.sh
 [S3 API]: https://docs.aws.amazon.com/AmazonS3/latest/API/Type_API_Reference.html
 [Semantic Versioning 2.0.0]: https://semver.org

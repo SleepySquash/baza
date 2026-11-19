@@ -1,31 +1,44 @@
 //! S3 HTTP API implementation of Baza.
 
 use std::{
-    convert::Infallible,
     error, fmt, io,
-    net::{TcpListener, ToSocketAddrs},
-    time::UNIX_EPOCH,
+    net::{self, ToSocketAddrs},
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use baza::{
     CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, FileList,
     FileMeta, GetFile, GetFileMeta, ListFiles, ReadOnlyFile, RelativePath,
-    async_trait, futures::future,
+    async_trait,
+    futures::{Stream, StreamExt as _},
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use derive_more::with_trait::{Display, Error, From};
-use hyper::{server::Server, service::make_service_fn};
+use hyper::body::Bytes;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
-use s3_server::{
-    S3Service, S3Storage, SimpleAuth, dto,
-    errors::{S3Error, S3ErrorCode, S3StorageError, S3StorageResult},
+use s3s::{
+    S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    auth::SimpleAuth,
+    dto::{self, ETag, StreamingBlob, Timestamp},
+    s3_error,
+    service::S3ServiceBuilder,
 };
 use secrecy::{ExposeSecret as _, SecretString};
+use tokio::net::TcpListener;
 use tokio_util::{compat::FuturesAsyncReadCompatExt as _, io::ReaderStream};
 
-/// [`dto::PutObjectRequest::metadata`] key where [`CreateSymlink::src`] is
+/// [`dto::PutObjectInput::metadata`] key where [`CreateSymlink::src`] is
 /// expected to be provided.
 pub const SYMLINK_META_KEY: &str = "symlink-to";
+
+/// Delay before accepting new connections again, after accepting one has
+/// failed (usually because of running out of file descriptors).
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
 
 /// Runs [`S3`] HTTP server.
 ///
@@ -40,24 +53,40 @@ pub async fn run_http_server<S, A>(
 ) -> Result<(), RunHttpServerError>
 where
     A: ToSocketAddrs,
-    S3<S>: S3Storage + Send + Sync + 'static,
+    S3<S>: s3s::S3,
 {
-    let mut auth = SimpleAuth::new();
-    auth.register(
-        access_key.expose_secret().to_owned(),
-        secret_key.expose_secret().to_owned(),
-    );
+    let mut s3 = S3ServiceBuilder::new(S3(storage));
+    s3.set_auth(SimpleAuth::from_single(
+        access_key.expose_secret(),
+        secret_key.expose_secret(),
+    ));
+    let service = s3.build();
 
-    let mut s3 = S3Service::new(S3(storage));
-    s3.set_auth(auth);
-
-    let service = s3.into_shared();
-    let listener = TcpListener::bind(addr)?;
-    let make_service =
-        make_service_fn(move |_| future::ok::<_, Infallible>(service.clone()));
+    let listener = net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(listener)?;
+    let http = auto::Builder::new(TokioExecutor::new());
 
     tracing::info!("Starting S3 HTTP Server");
-    Ok(Server::from_tcp(listener)?.serve(make_service).await?)
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::error!("Failed to accept connection: {e}");
+                tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
+                continue;
+            }
+        };
+
+        let (http, service) = (http.clone(), service.clone());
+        drop(tokio::spawn(async move {
+            if let Err(e) =
+                http.serve_connection(TokioIo::new(stream), service).await
+            {
+                tracing::debug!("HTTP connection failed: {e}");
+            }
+        }));
+    }
 }
 
 /// Possible error of executing [`run_http_server()`].
@@ -66,20 +95,16 @@ pub enum RunHttpServerError {
     /// Failed to bind address.
     #[display("Failed to bind address: {_0}")]
     BindAddress(io::Error),
-
-    /// [`hyper`] server failure.
-    #[display("Hyper server failed: {_0}")]
-    Hyper(hyper::Error),
 }
 
-/// Actual [`S3Storage`] implementation.
+/// Actual [`s3s::S3`] implementation.
 #[derive(Clone, Debug)]
 pub struct S3<T>(T);
 
 #[async_trait]
-impl<S, E1, E2, E3, E4, E5, E6> S3Storage for S3<S>
+impl<S, E1, E2, E3, E4, E5, E6> s3s::S3 for S3<S>
 where
-    S: Exec<CreateFile<dto::ByteStream>, Err = E1>
+    S: Exec<CreateFile<ObjectBody>, Err = E1>
         + Exec<CreateSymlink, Err = E2>
         + Exec<DeleteFile, Ok = (), Err = E3>
         + Exec<GetFile, Ok = Option<ReadOnlyFile>, Err = E4>
@@ -96,77 +121,40 @@ where
     E5: fmt::Display,
     E6: fmt::Display,
 {
-    async fn complete_multipart_upload(
-        &self,
-        _: dto::CompleteMultipartUploadRequest,
-    ) -> S3StorageResult<
-        dto::CompleteMultipartUploadOutput,
-        dto::CompleteMultipartUploadError,
-    > {
-        Err(not_implemented("CompleteMultipartUpload").into())
-    }
-
-    async fn copy_object(
-        &self,
-        _: dto::CopyObjectRequest,
-    ) -> S3StorageResult<dto::CopyObjectOutput, dto::CopyObjectError> {
-        Err(not_implemented("CopyObject").into())
-    }
-
-    async fn create_multipart_upload(
-        &self,
-        _: dto::CreateMultipartUploadRequest,
-    ) -> S3StorageResult<
-        dto::CreateMultipartUploadOutput,
-        dto::CreateMultipartUploadError,
-    > {
-        Err(not_implemented("CreateMultipartUpload").into())
-    }
-
-    async fn create_bucket(
-        &self,
-        _: dto::CreateBucketRequest,
-    ) -> S3StorageResult<dto::CreateBucketOutput, dto::CreateBucketError> {
-        Err(not_implemented("CreateBucket").into())
-    }
-
-    async fn delete_bucket(
-        &self,
-        _: dto::DeleteBucketRequest,
-    ) -> S3StorageResult<dto::DeleteBucketOutput, dto::DeleteBucketError> {
-        Err(not_implemented("DeleteBucket").into())
-    }
-
     #[tracing::instrument(
         skip_all,
-        fields(bucket = input.bucket.as_str(), key = input.key.as_str()),
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+        ),
     )]
     async fn delete_object(
         &self,
-        input: dto::DeleteObjectRequest,
-    ) -> S3StorageResult<dto::DeleteObjectOutput, dto::DeleteObjectError> {
-        let path = parse_uri_s3_path(input.bucket, &input.key)?;
+        req: S3Request<dto::DeleteObjectInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectOutput>> {
+        let input = req.input;
+        let path = parse_s3_path(input.bucket, input.key)?;
 
         self.delete_file(path)
             .await
             .map_err(|e| internal_error("DeleteFile operation failed", e))?;
 
         tracing::info!("OK");
-        Ok(dto::DeleteObjectOutput::default())
+        Ok(S3Response::new(dto::DeleteObjectOutput::default()))
     }
 
     #[tracing::instrument(
         skip_all,
         fields(
-            bucket = input.bucket.as_str(),
-            count = input.delete.objects.len(),
+            bucket = req.input.bucket.as_str(),
+            count = req.input.delete.objects.len(),
         ),
     )]
     async fn delete_objects(
         &self,
-        input: dto::DeleteObjectsRequest,
-    ) -> S3StorageResult<dto::DeleteObjectsOutput, dto::DeleteObjectsError>
-    {
+        req: S3Request<dto::DeleteObjectsInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectsOutput>> {
+        let input = req.input;
         let quiet = input.delete.quiet.unwrap_or_default();
 
         let (mut deleted, mut errors) = (vec![], vec![]);
@@ -189,8 +177,8 @@ where
                     version_id: obj.version_id,
                     ..dto::DeletedObject::default()
                 }),
-                Err((code, msg)) => errors.push(rusoto_s3::S3Error {
-                    code: Some(code.as_static_str().to_owned()),
+                Err((code, msg)) => errors.push(dto::Error {
+                    code: Some(code.as_str().to_owned()),
                     key: Some(obj.key),
                     message: Some(msg),
                     version_id: obj.version_id,
@@ -199,115 +187,96 @@ where
         }
 
         tracing::info!("OK");
-        Ok(dto::DeleteObjectsOutput {
+        Ok(S3Response::new(dto::DeleteObjectsOutput {
             deleted: Some(deleted),
             errors: Some(errors),
             ..dto::DeleteObjectsOutput::default()
-        })
-    }
-
-    async fn get_bucket_location(
-        &self,
-        _: dto::GetBucketLocationRequest,
-    ) -> S3StorageResult<
-        dto::GetBucketLocationOutput,
-        dto::GetBucketLocationError,
-    > {
-        Err(not_implemented("GetBucketLocation").into())
+        }))
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(bucket = input.bucket.as_str(), key = input.key.as_str()),
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+        ),
     )]
     async fn get_object(
         &self,
-        input: dto::GetObjectRequest,
-    ) -> S3StorageResult<dto::GetObjectOutput, dto::GetObjectError> {
-        let path = parse_uri_s3_path(input.bucket, &input.key)?;
+        req: S3Request<dto::GetObjectInput>,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        let input = req.input;
+        let path = parse_s3_path(input.bucket, input.key)?;
 
         let file = self
             .0
             .exec(GetFile { path })
             .await
             .map_err(|e| internal_error("GetFile operation failed", e))?
-            .ok_or(S3StorageError::Operation(
-                dto::GetObjectError::NoSuchKey(input.key),
-            ))?;
+            .ok_or_else(|| s3_error!(NoSuchKey))?;
 
         let headers = ObjectHeaders::try_from(file.meta())?;
         let reader = ReaderStream::new(file.compat());
 
         tracing::info!("OK");
-        Ok(dto::GetObjectOutput {
-            body: Some(dto::ByteStream::new(reader)),
+        Ok(S3Response::new(dto::GetObjectOutput {
+            body: Some(StreamingBlob::wrap(reader)),
             content_length: Some(headers.content_length),
             content_type: Some(headers.content_type),
             e_tag: Some(headers.e_tag),
             last_modified: Some(headers.last_modified),
             ..dto::GetObjectOutput::default()
-        })
-    }
-
-    async fn head_bucket(
-        &self,
-        _: dto::HeadBucketRequest,
-    ) -> S3StorageResult<dto::HeadBucketOutput, dto::HeadBucketError> {
-        Err(not_implemented("HeadBucket").into())
+        }))
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(bucket = input.bucket.as_str(), key = input.key.as_str()),
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+        ),
     )]
     async fn head_object(
         &self,
-        input: dto::HeadObjectRequest,
-    ) -> S3StorageResult<dto::HeadObjectOutput, dto::HeadObjectError> {
-        let path = parse_uri_s3_path(input.bucket, &input.key)?;
+        req: S3Request<dto::HeadObjectInput>,
+    ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
+        let input = req.input;
+        let path = parse_s3_path(input.bucket, input.key)?;
 
         let meta = self
             .0
             .exec(GetFileMeta { path })
             .await
             .map_err(|e| internal_error("GetFileMeta operation failed", e))?
-            .ok_or(S3StorageError::Operation(
-                dto::HeadObjectError::NoSuchKey(input.key),
-            ))?;
+            .ok_or_else(|| s3_error!(NoSuchKey))?;
 
         let headers = ObjectHeaders::try_from(&meta)?;
 
         tracing::info!("OK");
-        Ok(dto::HeadObjectOutput {
+        Ok(S3Response::new(dto::HeadObjectOutput {
             content_length: Some(headers.content_length),
             content_type: Some(headers.content_type),
             e_tag: Some(headers.e_tag),
             last_modified: Some(headers.last_modified),
             ..dto::HeadObjectOutput::default()
-        })
-    }
-
-    async fn list_buckets(
-        &self,
-        _: dto::ListBucketsRequest,
-    ) -> S3StorageResult<dto::ListBucketsOutput, dto::ListBucketsError> {
-        Err(not_implemented("ListBuckets").into())
+        }))
     }
 
     #[tracing::instrument(
         skip_all,
         fields(
-            bucket = input.bucket.as_str(),
-            delimiter = input.delimiter.as_deref(),
-            marker = input.marker.as_deref(),
-            prefix = input.prefix.as_deref(),
+            bucket = req.input.bucket.as_str(),
+            delimiter = req.input.delimiter.as_deref(),
+            marker = req.input.marker.as_deref(),
+            prefix = req.input.prefix.as_deref(),
         ),
     )]
     async fn list_objects(
         &self,
-        input: dto::ListObjectsRequest,
-    ) -> S3StorageResult<dto::ListObjectsOutput, dto::ListObjectsError> {
-        let encoding = KeyEncoding::parse(input.encoding_type.as_deref())?;
+        req: S3Request<dto::ListObjectsInput>,
+    ) -> S3Result<S3Response<dto::ListObjectsOutput>> {
+        let input = req.input;
+        let encoding = KeyEncoding::parse(input.encoding_type.as_ref())?;
         let op = list_files_op(
             input.bucket.clone(),
             input.prefix.clone(),
@@ -317,48 +286,45 @@ where
         )?;
         let max_keys = op.max_keys;
 
-        let mut list = self
+        let list = self
             .0
             .exec(op)
             .await
             .map_err(|e| internal_error("ListFiles operation failed", e))?;
-        one_common_prefix_per_page(&mut list);
         let (contents, common_prefixes) = list_entries(&list, encoding)?;
 
         tracing::info!("OK");
-        Ok(dto::ListObjectsOutput {
-            // `s3_server` writes an empty `CommonPrefixes` element otherwise,
-            // which clients parse as a single common prefix without a value.
-            common_prefixes: (!common_prefixes.is_empty())
-                .then_some(common_prefixes),
+        Ok(S3Response::new(dto::ListObjectsOutput {
+            common_prefixes: Some(common_prefixes),
             contents: Some(contents),
             delimiter: input.delimiter.map(|d| encoding.encode(&d)),
             encoding_type: input.encoding_type,
             is_truncated: Some(list.is_truncated),
             marker: Some(encoding.encode(&input.marker.unwrap_or_default())),
-            max_keys: Some(max_keys.try_into().unwrap_or(i64::MAX)),
+            max_keys: Some(max_keys.try_into().unwrap_or(i32::MAX)),
             name: Some(input.bucket),
             next_marker: list.next_start_after.map(|m| encoding.encode(&m)),
             prefix: Some(encoding.encode(&input.prefix.unwrap_or_default())),
-        })
+            ..dto::ListObjectsOutput::default()
+        }))
     }
 
     #[tracing::instrument(
         skip_all,
         fields(
-            bucket = input.bucket.as_str(),
-            continuation_token = input.continuation_token.as_deref(),
-            delimiter = input.delimiter.as_deref(),
-            prefix = input.prefix.as_deref(),
-            start_after = input.start_after.as_deref(),
+            bucket = req.input.bucket.as_str(),
+            continuation_token = req.input.continuation_token.as_deref(),
+            delimiter = req.input.delimiter.as_deref(),
+            prefix = req.input.prefix.as_deref(),
+            start_after = req.input.start_after.as_deref(),
         ),
     )]
     async fn list_objects_v2(
         &self,
-        input: dto::ListObjectsV2Request,
-    ) -> S3StorageResult<dto::ListObjectsV2Output, dto::ListObjectsV2Error>
-    {
-        let encoding = KeyEncoding::parse(input.encoding_type.as_deref())?;
+        req: S3Request<dto::ListObjectsV2Input>,
+    ) -> S3Result<S3Response<dto::ListObjectsV2Output>> {
+        let input = req.input;
+        let encoding = KeyEncoding::parse(input.encoding_type.as_ref())?;
         // Continuation token is just the last listed entry, so it always goes
         // after the `start_after` provided along with it in the first request.
         let op = list_files_op(
@@ -370,46 +336,45 @@ where
         )?;
         let max_keys = op.max_keys;
 
-        let mut list = self
+        let list = self
             .0
             .exec(op)
             .await
             .map_err(|e| internal_error("ListFiles operation failed", e))?;
-        one_common_prefix_per_page(&mut list);
         let (contents, common_prefixes) = list_entries(&list, encoding)?;
-        // TODO: `s3_server` writes `max_keys` as `KeyCount`, fix it once
-        //       migrated to `s3s`.
         let key_count = contents.len() + common_prefixes.len();
 
         tracing::info!("OK");
-        Ok(dto::ListObjectsV2Output {
-            // `s3_server` writes an empty `CommonPrefixes` element otherwise,
-            // which clients parse as a single common prefix without a value.
-            common_prefixes: (!common_prefixes.is_empty())
-                .then_some(common_prefixes),
+        Ok(S3Response::new(dto::ListObjectsV2Output {
+            common_prefixes: Some(common_prefixes),
             contents: Some(contents),
             continuation_token: input.continuation_token,
             delimiter: input.delimiter.map(|d| encoding.encode(&d)),
             encoding_type: input.encoding_type,
             is_truncated: Some(list.is_truncated),
-            key_count: Some(key_count.try_into().unwrap_or(i64::MAX)),
-            max_keys: Some(max_keys.try_into().unwrap_or(i64::MAX)),
+            key_count: Some(key_count.try_into().unwrap_or(i32::MAX)),
+            max_keys: Some(max_keys.try_into().unwrap_or(i32::MAX)),
             name: Some(input.bucket),
             next_continuation_token: list.next_start_after,
             prefix: Some(encoding.encode(&input.prefix.unwrap_or_default())),
             start_after: input.start_after.map(|s| encoding.encode(&s)),
-        })
+            ..dto::ListObjectsV2Output::default()
+        }))
     }
 
     #[tracing::instrument(
-       skip_all,
-       fields(bucket = input.bucket.as_str(), key = input.key.as_str()),
+        skip_all,
+        fields(
+            bucket = req.input.bucket.as_str(),
+            key = req.input.key.as_str(),
+        ),
     )]
     async fn put_object(
         &self,
-        input: dto::PutObjectRequest,
-    ) -> S3StorageResult<dto::PutObjectOutput, dto::PutObjectError> {
-        let path = parse_uri_s3_path(input.bucket, &input.key)?;
+        req: S3Request<dto::PutObjectInput>,
+    ) -> S3Result<S3Response<dto::PutObjectOutput>> {
+        let input = req.input;
+        let path = parse_s3_path(input.bucket, input.key)?;
 
         if let Some(original) =
             input.metadata.and_then(|mut meta| meta.remove(SYMLINK_META_KEY))
@@ -426,23 +391,20 @@ where
         } else {
             let op = CreateFile {
                 path,
-                bytes: input.body.unwrap_or_else(|| vec![].into()),
+                bytes: ObjectBody(
+                    input
+                        .body
+                        .unwrap_or_else(|| StreamingBlob::from(Bytes::new())),
+                ),
             };
 
             self.0.exec(op).await.map_err(|e| {
                 internal_error("CreateFile operation failed", e)
             })?;
-        };
+        }
 
         tracing::info!("OK");
-        Ok(dto::PutObjectOutput::default())
-    }
-
-    async fn upload_part(
-        &self,
-        _: dto::UploadPartRequest,
-    ) -> S3StorageResult<dto::UploadPartOutput, dto::UploadPartError> {
-        Err(not_implemented("UploadPart").into())
+        Ok(S3Response::new(dto::PutObjectOutput::default()))
     }
 }
 
@@ -461,6 +423,30 @@ where
             }
             res => res,
         }
+    }
+}
+
+/// [`Stream`] of an uploaded object's bytes, as [`CreateFile::bytes`] are
+/// expected to be.
+///
+/// Wraps a [`StreamingBlob`], converting its errors into [`io::Error`]s.
+#[derive(Debug)]
+pub struct ObjectBody(StreamingBlob);
+
+impl Stream for ObjectBody {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.0
+            .poll_next_unpin(cx)
+            .map(|chunk| chunk.map(|res| res.map_err(io::Error::other)))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 
@@ -484,14 +470,10 @@ struct ObjectHeaders {
     /// computed or stored. To not be mistaken for an MD5 digest, it contains a
     /// `-`, as multipart upload `ETag`s do, so clients skip verifying the
     /// content against it.
-    e_tag: String,
+    e_tag: ETag,
 
-    /// Last modification time of the object, in [RFC 3339] format with
-    /// milliseconds and `Z` suffix (like `2009-10-12T17:50:30.000Z`), as
-    /// [`s3_server`] expects and S3 returns in object listings.
-    ///
-    /// [RFC 3339]: https://www.rfc-editor.org/rfc/rfc3339
-    last_modified: String,
+    /// Last modification time of the object.
+    last_modified: Timestamp,
 }
 
 impl TryFrom<&FileMeta> for ObjectHeaders {
@@ -510,9 +492,8 @@ impl TryFrom<&FileMeta> for ObjectHeaders {
         Ok(Self {
             content_length,
             content_type: "application/octet-stream".into(),
-            e_tag: format!("\"{mtime:x}-{:x}\"", meta.size),
-            last_modified: DateTime::<Utc>::from(meta.modified)
-                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            e_tag: ETag::Strong(format!("{mtime:x}-{:x}", meta.size)),
+            last_modified: meta.modified.into(),
         })
     }
 }
@@ -533,14 +514,11 @@ fn list_files_op(
     prefix: Option<String>,
     delimiter: Option<String>,
     start_after: Option<String>,
-    max_keys: Option<i64>,
+    max_keys: Option<i32>,
 ) -> Result<ListFiles, S3Error> {
     let max_keys = max_keys.map_or(Ok(MAX_KEYS), |n| {
         usize::try_from(n).map(|n| n.min(MAX_KEYS)).map_err(|_| {
-            S3Error::new(
-                S3ErrorCode::InvalidArgument,
-                "`max-keys` cannot be negative",
-            )
+            s3_error!(InvalidArgument, "`max-keys` cannot be negative")
         })
     })?;
 
@@ -553,36 +531,6 @@ fn list_files_op(
     })
 }
 
-/// Truncates the provided [`FileList`] right before its second common prefix
-/// (if any), so it contains at most one.
-///
-/// [`s3_server`] serializes all the `CommonPrefixes` into a single XML element,
-/// rather than one element per common prefix, as S3 does, so clients see only
-/// one of them. Listing at most one common prefix per page keeps listings
-/// correct, just split into more pages, because S3 allows returning fewer
-/// entries than `max-keys`.
-// TODO: Remove once migrated to `s3s`.
-fn one_common_prefix_per_page(list: &mut FileList) {
-    if list.common_prefixes.len() < 2 {
-        return;
-    }
-    let second = list.common_prefixes.swap_remove(1);
-    list.common_prefixes.truncate(1);
-
-    // Both files and common prefixes are sorted, so the files listed before
-    // the second common prefix are the ones less than it.
-    let len = list.files.partition_point(|f| f.key < second);
-    list.files.truncate(len);
-
-    list.is_truncated = true;
-    list.next_start_after = list
-        .files
-        .last()
-        .map(|f| &f.key)
-        .max(list.common_prefixes.first())
-        .cloned();
-}
-
 /// Converts the provided [`FileList`] into `Contents` and `CommonPrefixes` of a
 /// `ListObjects` or `ListObjectsV2` response, encoding them with the provided
 /// [`KeyEncoding`].
@@ -593,7 +541,7 @@ fn one_common_prefix_per_page(list: &mut FileList) {
 fn list_entries(
     list: &FileList,
     encoding: KeyEncoding,
-) -> Result<(Vec<dto::Object>, Vec<rusoto_s3::CommonPrefix>), S3Error> {
+) -> Result<(Vec<dto::Object>, Vec<dto::CommonPrefix>), S3Error> {
     let contents = list
         .files
         .iter()
@@ -604,7 +552,9 @@ fn list_entries(
                 key: Some(encoding.encode(&file.key)),
                 last_modified: Some(headers.last_modified),
                 size: Some(headers.content_length),
-                storage_class: Some("STANDARD".into()),
+                storage_class: Some(dto::ObjectStorageClass::from_static(
+                    dto::ObjectStorageClass::STANDARD,
+                )),
                 ..dto::Object::default()
             })
         })
@@ -612,7 +562,7 @@ fn list_entries(
     let common_prefixes = list
         .common_prefixes
         .iter()
-        .map(|p| rusoto_s3::CommonPrefix { prefix: Some(encoding.encode(p)) })
+        .map(|p| dto::CommonPrefix { prefix: Some(encoding.encode(p)) })
         .collect();
 
     Ok((contents, common_prefixes))
@@ -646,14 +596,17 @@ impl KeyEncoding {
     /// # Errors
     ///
     /// If the `encoding-type` is neither absent, nor `url`.
-    fn parse(encoding_type: Option<&str>) -> Result<Self, S3Error> {
-        match encoding_type {
+    fn parse(
+        encoding_type: Option<&dto::EncodingType>,
+    ) -> Result<Self, S3Error> {
+        match encoding_type.map(dto::EncodingType::as_str) {
             None => Ok(Self::None),
-            Some(t) if t.eq_ignore_ascii_case("url") => Ok(Self::Url),
-            Some(t) => Err(S3Error::new(
-                S3ErrorCode::InvalidArgument,
-                format!("Invalid `encoding-type`: {t}"),
-            )),
+            Some(t) if t.eq_ignore_ascii_case(dto::EncodingType::URL) => {
+                Ok(Self::Url)
+            }
+            Some(t) => {
+                Err(s3_error!(InvalidArgument, "Invalid `encoding-type`: {t}"))
+            }
         }
     }
 
@@ -667,21 +620,6 @@ impl KeyEncoding {
             }
         }
     }
-}
-
-/// Parses the provided `bucket` and percent-encoded `key` (as they're taken
-/// from a request URI path) into a single [`RelativePath`].
-///
-/// [`s3_server`] doesn't decode object keys taken from request URI paths, so
-/// they're decoded here.
-fn parse_uri_s3_path(
-    bucket: String,
-    key: &str,
-) -> Result<RelativePath, InvalidArgument> {
-    let key = percent_encoding::percent_decode_str(key)
-        .decode_utf8()
-        .map_err(|e| InvalidArgument { attr: "key", err: Box::new(e) })?;
-    parse_s3_path(bucket, key.into_owned())
 }
 
 /// Parses the provided `bucket` and `key` into a single [`RelativePath`].
@@ -701,8 +639,7 @@ fn parse_relative_path(
     s.try_into().map_err(|err| InvalidArgument { attr, err: Box::new(err) })
 }
 
-/// Invalid [`RelativePath`] (or a key not decodable into one) provided as the
-/// `attr` of a request.
+/// Invalid [`RelativePath`] provided as the `attr` of a request.
 ///
 /// Converts into a [`S3ErrorCode::InvalidArgument`] [`S3Error`].
 #[derive(Debug, Display)]
@@ -718,26 +655,11 @@ struct InvalidArgument {
 
 impl From<InvalidArgument> for S3Error {
     fn from(e: InvalidArgument) -> Self {
-        Self::new(S3ErrorCode::InvalidArgument, e.to_string())
+        Self::with_message(S3ErrorCode::InvalidArgument, e.to_string())
     }
-}
-
-impl<E> From<InvalidArgument> for S3StorageError<E> {
-    fn from(e: InvalidArgument) -> Self {
-        S3Error::from(e).into()
-    }
-}
-
-/// Constructs a [`S3ErrorCode::NotImplemented`] [`S3Error`] for the provided
-/// unsupported S3 `operation`.
-fn not_implemented(operation: &str) -> S3Error {
-    S3Error::new(
-        S3ErrorCode::NotImplemented,
-        format!("`{operation}` operation is not implemented"),
-    )
 }
 
 /// Constructs an internal [`S3Error`].
 fn internal_error<E: fmt::Display>(msg: &str, e: E) -> S3Error {
-    S3Error::new(S3ErrorCode::InternalError, format!("{msg}: {e}"))
+    S3Error::with_message(S3ErrorCode::InternalError, format!("{msg}: {e}"))
 }

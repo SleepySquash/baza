@@ -2,7 +2,7 @@
 name = "baza"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 description = "Simply scalable files storage without much fuss."
 authors = ["Instrumentisto Team <developer@instrumentisto.com>"]
 license = "BlueOak-1.0.0"
@@ -21,7 +21,7 @@ baza = { package = "baza-lib", path = "lib" }
 baza-api-s3 = { path = "api/s3" }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 secrecy = "0.10"
-tokio = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 

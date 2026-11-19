@@ -9,7 +9,7 @@ use std::{
 };
 
 use baza::futures::TryStreamExt as _;
-use rand::{Rng as _, distr::Alphanumeric};
+use rand::{RngExt as _, distr::Alphanumeric};
 
 /// Path to the directory where files are stored during E2E tests running.
 const DATA_DIR: &str = "../.cache/baza/data";
