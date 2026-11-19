@@ -16,7 +16,9 @@ eq = $(if $(or $(1),$(2)),$(and $(findstring $(1),$(2)),\
 ######################
 
 NAME := baza
-OWNER := $(or $(GITHUB_REPOSITORY_OWNER),instrumentisto)
+# Lowercased, as Docker image names cannot contain uppercase letters.
+OWNER := $(shell echo '$(or $(GITHUB_REPOSITORY_OWNER),sleepysquash)' \
+                 | tr '[:upper:]' '[:lower:]')
 REGISTRIES := $(strip $(subst $(comma), ,\
 	$(shell grep -m1 'registry: \["' .github/workflows/ci.yml \
 	        | cut -d':' -f2 | tr -d '"][')))

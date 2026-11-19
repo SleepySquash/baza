@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/instrumentisto/baza
+  repository: ghcr.io/sleepysquash/baza
   tag: "0.2"
   pullPolicy: IfNotPresent
   credentials: {}

@@ -6,6 +6,16 @@ All user visible changes to this project will be documented in this file. This p
 
 
 
+## [0.6.0] · unreleased
+[0.6.0]: https://github.com/SleepySquash/baza/tree/main/helm/baza
+
+### BC Breaks
+
+- Changed default `image.repository` value to `ghcr.io/sleepysquash/baza`.
+
+
+
+
 ## [0.5.0] · 2025-12-05
 [0.5.0]: https://github.com/instrumentisto/baza/tree/helm%2Fbaza%2F0.5.0/helm/baza
 

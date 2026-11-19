@@ -6,3 +6,4 @@ shell.nix
 
 /.cache/
 /target/
+/docs/

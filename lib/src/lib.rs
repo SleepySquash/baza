@@ -14,6 +14,10 @@ use tracerr::Traced;
 use uuid::Uuid;
 
 /// Execution of a filesystem operation.
+#[allow( // false positive on newer Clippy versions
+    clippy::double_must_use,
+    reason = "`#[must_use]` is added by `#[async_trait]` macro"
+)]
 #[async_trait]
 pub trait Exec<Operation> {
     type Ok;

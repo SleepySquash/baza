@@ -238,48 +238,29 @@ jobs:
          && (github.ref == 'refs/heads/main'
              || startsWith(github.ref, 'refs/tags/v')) }}
     needs: ["docker", "test-e2e-release"]
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
-        registry: ["docker.io", "ghcr.io", "quay.io"]
+        registry: ["ghcr.io"]
     runs-on: ubuntu-latest
     steps:
-      # Skip if this is fork and no credentials are provided.
-      - id: skip
-        run: echo "no=${{ !(
-               github.repository_owner != 'instrumentisto'
-               && ((matrix.registry == 'quay.io'
-                    && secrets.QUAYIO_ROBOT_USER == '')
-                || (matrix.registry == 'docker.io'
-                    && secrets.DOCKERHUB_BOT_USER == ''))
-             ) }}" >> $GITHUB_OUTPUT
-
       - uses: actions/checkout@v6
-        if: ${{ steps.skip.outputs.no == 'true' }}
 
       - uses: actions/download-artifact@v8
         with:
           name: docker-${{ github.run_number }}
           path: .cache/docker/
-        if: ${{ steps.skip.outputs.no == 'true' }}
       - run: make docker.untar
-        if: ${{ steps.skip.outputs.no == 'true' }}
 
       - name: Login to ${{ matrix.registry }} container registry
         uses: docker/login-action@v4
         with:
           registry: ${{ matrix.registry }}
-          username: ${{ (matrix.registry == 'docker.io'
-                         && secrets.DOCKERHUB_BOT_USER)
-                     || (matrix.registry == 'quay.io'
-                         && secrets.QUAYIO_ROBOT_USER)
-                     || github.repository_owner }}
-          password: ${{ (matrix.registry == 'docker.io'
-                         && secrets.DOCKERHUB_BOT_PASS)
-                     || (matrix.registry == 'quay.io'
-                         && secrets.QUAYIO_ROBOT_TOKEN)
-                     || secrets.GITHUB_TOKEN }}
-        if: ${{ steps.skip.outputs.no == 'true' }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Parse semver versions from Git tag
         id: semver
@@ -287,8 +268,7 @@ jobs:
         with:
           text: ${{ github.ref }}
           regex: '^refs/tags/v((([0-9]+)\.[0-9]+)\.[0-9]+(-.+)?)$'
-        if: ${{ steps.skip.outputs.no == 'true'
-             && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: Form version Docker tags
         id: tags
         uses: actions/github-script@v9
@@ -304,8 +284,7 @@ jobs:
               versions += ',latest';
             }
             return versions;
-        if: ${{ steps.skip.outputs.no == 'true'
-             && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - run: make docker.tags
                   registries=${{ matrix.registry }}
@@ -313,41 +292,19 @@ jobs:
                   tags=${{ (startsWith(github.ref, 'refs/tags/v')
                             && steps.tags.outputs.result)
                         ||     'edge' }}
-        if: ${{ steps.skip.outputs.no == 'true' }}
+      # On GitHub Container Registry README is automatically updated on pushes.
       - run: make docker.push
                   registries=${{ matrix.registry }}
                   tags=${{ (startsWith(github.ref, 'refs/tags/v')
                             && steps.tags.outputs.result)
                         ||     'edge' }}
-        if: ${{ steps.skip.outputs.no == 'true' }}
-
-      # On GitHub Container Registry README is automatically updated on pushes.
-      - name: Update README on Docker Hub
-        uses: christian-korneck/update-container-description-action@v1
-        with:
-          provider: dockerhub
-          destination_container_repo: ${{ github.repository }}
-          readme_file: README.md
-        env:
-          DOCKER_USER: ${{ secrets.DOCKERHUB_BOT_USER }}
-          DOCKER_PASS: ${{ secrets.DOCKERHUB_BOT_PASS }}
-        if: ${{ steps.skip.outputs.no == 'true'
-             && matrix.registry == 'docker.io' }}
-      - name: Update README on Quay.io
-        uses: christian-korneck/update-container-description-action@v1
-        with:
-          provider: quay
-          destination_container_repo: ${{ matrix.registry }}/${{ github.repository }}
-          readme_file: README.md
-        env:
-          DOCKER_APIKEY: ${{ secrets.QUAYIO_API_TOKEN }}
-        if: ${{ steps.skip.outputs.no == 'true'
-             && matrix.registry == 'quay.io' }}
 
   helm-push:
     name: helm push
     if: ${{ startsWith(github.ref, 'refs/tags/helm/') }}
     needs: ["helm-lint"]
+    permissions:
+      contents: write
     strategy:
       max-parallel: 1
       matrix:
@@ -456,6 +413,8 @@ jobs:
       - test-e2e-debug
       - test-e2e-release
       - test-unit
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -6,6 +6,8 @@ rust-version = "1.85"
 description = "Actual Baza implementation as library."
 authors = ["Instrumentisto Team <developer@instrumentisto.com>"]
 license = "BlueOak-1.0.0"
+homepage = "https://github.com/SleepySquash/baza"
+repository = "https://github.com/SleepySquash/baza"
 publish = false
 
 [dependencies]

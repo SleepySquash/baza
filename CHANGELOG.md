@@ -6,6 +6,19 @@ All user visible changes to this project will be documented in this file. This p
 
 
 
+## [0.3.0] · unreleased
+[0.3.0]: /../../tree/main
+
+[Diff](/../../compare/v0.2.0...main)
+
+### Changed
+
+- Deployment:
+    - [Docker] image is published to `ghcr.io/sleepysquash/baza` only.
+
+
+
+
 ## [0.2.0] · 2022-08-23
 [0.2.0]: /../../tree/v0.2.0
 
