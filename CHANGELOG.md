@@ -13,34 +13,33 @@ All user visible changes to this project will be documented in this file. This p
 
 ### BC Breaks
 
-- Minimal supported Rust version is 1.96 now (was 1.85), as required by [`s3s`].
+- Minimal supported Rust version is 1.96.
 
 ### Added
 
 - [S3 API]:
-    - `DeleteObject` and `DeleteObjects` methods (deleting a symlink removes only the symlink itself, and empty parent directories are removed).
-    - `HeadObject` method (a symlink reports the metadata of the object it points to).
-    - `Content-Length`, `Content-Type`, `ETag` and `Last-Modified` headers to `GetObject` responses (`ETag` is derived from the object's size and modification time, rather than being an MD5 digest of its content, and `Content-Type` is always `application/octet-stream`).
-    - `ListObjects` and `ListObjectsV2` methods, supporting `prefix`, `delimiter`, `max-keys`, `marker`/`start-after`/`continuation-token` pagination and `encoding-type=url` (symlinks are listed with the metadata of the objects they point to, dangling symlinks are skipped, and a missing bucket is listed as an empty one).
+    - `DeleteObject` and `DeleteObjects` methods.
+    - `HeadObject` method.
+    - `ListObjects` and `ListObjectsV2` methods.
+    - `Content-Length`, `Content-Type`, `ETag` and `Last-Modified` headers to `GetObject` responses.
+    - HTTP/2 support.
 
 ### Changed
 
 - [S3 API]:
-    - Switched S3 protocol implementation from unmaintained [`s3-server`] to [`s3s`] 0.17, and HTTP server from [`hyper`] 0.14 to [`hyper`] 1 (also serving HTTP/2 now).
+    - Migrated from [`s3-server`] to [`s3s`].
 - Deployment:
-    - [Docker] image is built from the official `rust` image, instead of `ghcr.io/instrumentisto/rust`.
-    - [Docker] image is published to `ghcr.io/sleepysquash/baza` only.
+    - [Docker] image is published to `ghcr.io/sleepysquash/baza`.
 
 ### Fixed
 
 - [S3 API]:
-    - Unsupported methods panicking instead of returning a `NotImplemented` error.
-    - `PutObject` leaving a partially written object on a failed or interrupted upload (now written to `tmp/` and renamed atomically).
-    - `PutObject` of a regular file over an existing symlink writing through to the symlink's target instead of replacing the symlink.
-    - `GetObject` of a key that is a prefix of other objects (a directory on disk) failing instead of returning a `NoSuchKey` error.
-    - Object keys with URL-encoded characters (like spaces) being stored in their URL-encoded form (`a%20b` instead of `a b`).
-    - Signature verification failing with `403` for some keys with URL-encoded characters (like `HeadObject` of a key with a space, sent by `aws-sdk-go-v2`).
-    - `ListObjects` and `ListObjectsV2` returning all `CommonPrefixes` in a single XML element, and `ListObjectsV2` returning `max-keys` as `KeyCount`.
+    - Panics on unsupported methods.
+    - `PutObject` leaving partially written objects.
+    - `PutObject` over a symlink writing to its target.
+    - `GetObject` of a directory not returning `NoSuchKey`.
+    - Object keys being stored URL-encoded.
+    - Signature verification failing for URL-encoded keys.
 
 
 
@@ -93,7 +92,6 @@ All user visible changes to this project will be documented in this file. This p
 
 [CLI]: https://en.wikipedia.org/wiki/Command-line_interface
 [Docker]: https://www.docker.com
-[`hyper`]: https://docs.rs/hyper
 [`s3-server`]: https://docs.rs/s3-server
 [`s3s`]: https://docs.rs/s3s
 [Helm]: https://helm.sh
