@@ -233,6 +233,7 @@ name = "baza-api-s3"
 version = "0.0.0"
 dependencies = [
  "baza-lib",
+ "chrono",
  "derive_more",
  "hyper",
  "rusoto_s3 0.47.0",
@@ -250,6 +251,7 @@ dependencies = [
  "baza-api-s3",
  "baza-lib",
  "cucumber",
+ "httpdate",
  "rand",
  "rusoto_core 0.48.0",
  "rusoto_credential 0.48.0",

@@ -1,8 +1,9 @@
 use std::{
-    fmt, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
     pin::Pin,
     task,
+    time::SystemTime,
 };
 
 use async_fs::File;
@@ -312,16 +313,7 @@ impl Exec<DeleteFile> for Storage {
 
         match async_fs::remove_file(&path).await {
             Ok(()) => {}
-            // `NotADirectory` means that some parent of the `path` is a file,
-            // so there is no file at the `path` either.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory,
-                ) =>
-            {
-                return Ok(());
-            }
+            Err(e) if is_missing(&e) => return Ok(()),
             Err(e) => {
                 // Depending on the platform, removing a directory fails with
                 // different errors, so check it explicitly.
@@ -389,6 +381,16 @@ pub enum DeleteFileError {
 }
 
 /// Operation for getting an existing file.
+///
+/// Returns [`None`] if there is no file at the [`GetFile::path`], or it's a
+/// directory (a prefix of other objects in S3 terms, rather than an object
+/// itself).
+///
+/// # Symlinks
+///
+/// Symlinks are followed, so the returned [`ReadOnlyFile`] (and its
+/// [`FileMeta`]) is the one the symlink points to. Dangling symlinks are
+/// reported as [`None`].
 #[derive(Debug, Clone)]
 pub struct GetFile {
     /// [`RelativePath`] of the file.
@@ -405,16 +407,110 @@ impl Exec<GetFile> for Storage {
     async fn exec(&self, op: GetFile) -> Result<Self::Ok, Self::Err> {
         let path = self.data_dir.join(op.path);
 
-        match File::open(&path).await {
-            Ok(f) => Ok(Some(ReadOnlyFile(f))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        let file = match File::open(&path).await {
+            Ok(f) => f,
+            Err(e) if is_missing(&e) => return Ok(None),
+            Err(e) => return Err(tracerr::new!(e)),
+        };
+
+        // Metadata is taken from the opened file rather than from the `path`,
+        // so it always describes exactly the bytes being read, even if the
+        // file is replaced concurrently.
+        let meta = file.metadata().await.map_err(tracerr::wrap!())?;
+        Ok(FileMeta::from_metadata(&meta)
+            .map_err(tracerr::wrap!())?
+            .map(|meta| ReadOnlyFile { file, meta }))
+    }
+}
+
+/// Operation for getting [`FileMeta`] of an existing file.
+///
+/// Returns [`None`] if there is no file at the [`GetFileMeta::path`], or it's
+/// a directory (a prefix of other objects in S3 terms, rather than an object
+/// itself).
+///
+/// # Symlinks
+///
+/// Symlinks are followed, so the [`FileMeta`] of the file the symlink points to
+/// is returned. Dangling symlinks are reported as [`None`].
+#[derive(Clone, Debug)]
+pub struct GetFileMeta {
+    /// [`RelativePath`] of the file.
+    pub path: RelativePath,
+}
+
+#[async_trait]
+impl Exec<GetFileMeta> for Storage {
+    type Ok = Option<FileMeta>;
+    type Err = Traced<io::Error>;
+
+    #[allow(clippy::blocks_in_conditions)] // due to `instrument` attribute
+    #[tracing::instrument(level = "debug", err(Debug))]
+    async fn exec(&self, op: GetFileMeta) -> Result<Self::Ok, Self::Err> {
+        let path = self.data_dir.join(op.path);
+
+        match async_fs::metadata(&path).await {
+            Ok(meta) => {
+                FileMeta::from_metadata(&meta).map_err(tracerr::wrap!())
+            }
+            Err(e) if is_missing(&e) => Ok(None),
             Err(e) => Err(tracerr::new!(e)),
         }
     }
 }
 
-/// Read-only [`File`].
-pub struct ReadOnlyFile(File);
+/// Indicates whether the provided [`io::Error`] means that there is no file at
+/// the accessed path.
+///
+/// [`io::ErrorKind::NotADirectory`] means that some parent of the path is a
+/// file, so there is no file at the path either.
+fn is_missing(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+}
+
+/// Metadata of a file stored in a [`Storage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileMeta {
+    /// Size of the file in bytes.
+    pub size: u64,
+
+    /// Last modification time of the file.
+    pub modified: SystemTime,
+}
+
+impl FileMeta {
+    /// Creates a new [`FileMeta`] out of the provided [`fs::Metadata`].
+    ///
+    /// Returns [`None`] if the [`fs::Metadata`] doesn't describe a regular
+    /// file (a directory, for example).
+    ///
+    /// # Errors
+    ///
+    /// If the last modification time is not available on this platform.
+    fn from_metadata(meta: &fs::Metadata) -> io::Result<Option<Self>> {
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self { size: meta.len(), modified: meta.modified()? }))
+    }
+}
+
+/// Read-only [`File`] along with its [`FileMeta`].
+pub struct ReadOnlyFile {
+    /// Opened [`File`] itself.
+    file: File,
+
+    /// [`FileMeta`] of the opened [`File`].
+    meta: FileMeta,
+}
+
+impl ReadOnlyFile {
+    /// Returns [`FileMeta`] of this [`ReadOnlyFile`].
+    #[must_use]
+    pub const fn meta(&self) -> &FileMeta {
+        &self.meta
+    }
+}
 
 impl AsyncRead for ReadOnlyFile {
     fn poll_read(
@@ -422,7 +518,7 @@ impl AsyncRead for ReadOnlyFile {
         cx: &mut task::Context<'_>,
         buf: &mut [u8],
     ) -> task::Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.file).poll_read(cx, buf)
     }
 }
 
@@ -746,6 +842,140 @@ mod delete_file_spec {
 
         assert!(root.0.join("data/bucket/a/key").is_file());
         assert!(root.0.join("data/links/a/link").is_file());
+    }
+}
+
+#[cfg(test)]
+mod get_file_meta_spec {
+    use std::fs;
+
+    use futures::{executor::block_on, stream};
+
+    use super::{
+        CreateFile, CreateSymlink, DeleteFile, Exec as _, FileMeta, GetFile,
+        GetFileMeta, Storage,
+        spec_util::{Root, path},
+    };
+
+    async fn create(storage: &Storage, p: &str, bytes: &[u8]) {
+        let bytes = stream::iter([Ok(bytes.to_vec())]);
+        storage.exec(CreateFile { path: path(p), bytes }).await.unwrap();
+    }
+
+    async fn meta(storage: &Storage, p: &str) -> Option<FileMeta> {
+        storage.exec(GetFileMeta { path: path(p) }).await.unwrap()
+    }
+
+    #[test]
+    fn returns_size_and_modification_time() {
+        let root = Root::new();
+        let meta = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/dir/key", b"hello").await;
+
+            meta(&storage, "bucket/dir/key").await
+        })
+        .expect("no `FileMeta` returned");
+
+        let expected =
+            fs::metadata(root.0.join("data/bucket/dir/key")).unwrap();
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.modified, expected.modified().unwrap());
+    }
+
+    #[test]
+    fn follows_symlinks() {
+        let root = Root::new();
+        let (target, link) = block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/target", b"hello world").await;
+            storage
+                .exec(CreateSymlink {
+                    src: path("bucket/target"),
+                    dest: path("links/link"),
+                })
+                .await
+                .unwrap();
+
+            (
+                meta(&storage, "bucket/target").await,
+                meta(&storage, "links/link").await,
+            )
+        });
+
+        assert_eq!(link.expect("no `FileMeta` returned").size, 11);
+        assert_eq!(link, target);
+    }
+
+    #[test]
+    fn returns_none_for_missing_file() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/file", b"bytes").await;
+
+            for p in ["bucket/missing", "missing/key", "bucket/file/key"] {
+                assert_eq!(meta(&storage, p).await, None, "`{p}`");
+            }
+        });
+    }
+
+    #[test]
+    fn returns_none_for_directory() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/dir/key", b"bytes").await;
+
+            assert_eq!(meta(&storage, "bucket/dir").await, None);
+            assert!(
+                storage
+                    .exec(GetFile { path: path("bucket/dir") })
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "directory is returned as a file",
+            );
+        });
+    }
+
+    #[test]
+    fn returns_none_for_dangling_symlink() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/target", b"bytes").await;
+            storage
+                .exec(CreateSymlink {
+                    src: path("bucket/target"),
+                    dest: path("links/link"),
+                })
+                .await
+                .unwrap();
+            storage
+                .exec(DeleteFile { path: path("bucket/target") })
+                .await
+                .unwrap();
+
+            assert_eq!(meta(&storage, "links/link").await, None);
+        });
+    }
+
+    #[test]
+    fn matches_meta_of_get_file() {
+        let root = Root::new();
+        block_on(async {
+            let storage = Storage::new(&root.0).await.unwrap();
+            create(&storage, "bucket/key", b"bytes").await;
+
+            let file = storage
+                .exec(GetFile { path: path("bucket/key") })
+                .await
+                .unwrap()
+                .expect("no `ReadOnlyFile` returned");
+
+            assert_eq!(Some(*file.meta()), meta(&storage, "bucket/key").await);
+        });
     }
 }
 

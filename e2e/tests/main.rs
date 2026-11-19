@@ -31,6 +31,13 @@ struct World {
 
     /// Latest [`s3::HeadBucketResponse`] (if any).
     head_bucket_response: Option<s3::HeadBucketResponse>,
+
+    /// Latest [`s3::HeadObjectResponse`] (if any).
+    head_object_response: Option<s3::HeadObjectResponse>,
+
+    /// [`s3::ObjectMeta`]s of all the successful `GetObject` and `HeadObject`
+    /// requests, in the order they were received.
+    object_metas: Vec<s3::ObjectMeta>,
 }
 
 #[tokio::main]

@@ -10,8 +10,9 @@ use rusoto_credential::StaticProvider;
 use rusoto_s3::{
     Delete, DeleteObjectError, DeleteObjectRequest, DeleteObjectsError,
     DeleteObjectsOutput, DeleteObjectsRequest, GetObjectError,
-    GetObjectRequest, HeadBucketError, HeadBucketRequest, ObjectIdentifier,
-    PutObjectError, PutObjectRequest, S3 as _, S3Client,
+    GetObjectRequest, HeadBucketError, HeadBucketRequest, HeadObjectError,
+    HeadObjectRequest, ObjectIdentifier, PutObjectError, PutObjectRequest,
+    S3 as _, S3Client,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -237,8 +238,68 @@ async fn no_keys_reported(w: &mut World) {
 
 #[when(regex = r"^trying to load `(\S+)` from `(\S+)` bucket$")]
 async fn trying_to_load_file(w: &mut World, key: String, bucket: String) {
-    w.get_object_response =
-        Some(try_get_object(bucket, w.unique.filename(key)).await);
+    let res = try_get_object(bucket, w.unique.filename(key)).await;
+    w.get_object_response = Some(res.map(|(meta, bytes)| {
+        w.object_metas.push(meta);
+        bytes
+    }));
+}
+
+#[when(regex = r"^checking `(\S+)` metadata in `(\S+)` bucket$")]
+async fn checking_metadata(w: &mut World, key: String, bucket: String) {
+    head_object(w, bucket, w.unique.filename(key)).await;
+}
+
+#[when(regex = r"^checking `(\S+)` directory metadata in `(\S+)` bucket$")]
+async fn checking_directory_metadata(
+    w: &mut World,
+    key: String,
+    bucket: String,
+) {
+    // Directory names are not enriched with `World::unique`.
+    head_object(w, bucket, key).await;
+}
+
+#[then(regex = r"^its metadata matches `(\S+)` stored as `(\S+)`$")]
+async fn metadata_matches(
+    w: &mut World,
+    sample: String,
+    path: String,
+) -> io::Result<()> {
+    if let Some(Err(e)) = &w.head_object_response {
+        panic!("`HeadObjectRequest` failed: {e}");
+    }
+    let meta = w.object_metas.last().expect("No object metadata received");
+
+    let filename = w.unique.filename(path);
+    let stored = async_fs::metadata(format!("{DATA_DIR}/{filename}")).await?;
+
+    let size = i64::try_from(sample_file(sample).len()).unwrap();
+    assert_eq!(meta.content_length, Some(size), "`Content-Length` mismatch");
+    assert_eq!(
+        meta.last_modified,
+        Some(httpdate::fmt_http_date(stored.modified()?)),
+        "`Last-Modified` mismatch",
+    );
+    assert!(
+        meta.e_tag.as_ref().is_some_and(|t| !t.is_empty()),
+        "No `ETag` returned",
+    );
+    Ok(())
+}
+
+#[then(regex = r"^the ETag (is the same|has changed)$")]
+async fn etag_is_compared(w: &mut World, cmp: String) {
+    let [.., prev, last] = w.object_metas.as_slice() else {
+        panic!("Expected at least 2 object metadata to be received");
+    };
+    assert!(last.e_tag.is_some(), "No `ETag` returned");
+
+    if cmp == "is the same" {
+        assert_eq!(prev.e_tag, last.e_tag, "`ETag` has changed");
+    } else {
+        assert_ne!(prev.e_tag, last.e_tag, "`ETag` is the same");
+    }
 }
 
 #[then(regex = r"^`(\S+)` file is returned$")]
@@ -255,6 +316,17 @@ async fn file_is_returned(w: &mut World, name: String) {
 
 #[then(regex = r"^`NoSuchKey` error is returned$")]
 async fn error_is_returned(w: &mut World) {
+    if let Some(res) = w.head_object_response.take() {
+        // `HEAD` responses have no body, so only the status code can be
+        // checked.
+        match &res {
+            Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => {}
+            Err(RusotoError::Unknown(resp)) if resp.status.as_u16() == 404 => {}
+            _ => panic!("Expected `NoSuchKey` error, got: {res:#?}"),
+        }
+        return;
+    }
+
     let res = w.last_get_object_response();
     match res {
         Err(RusotoError::Service(GetObjectError::NoSuchKey(_))) => {}
@@ -314,6 +386,23 @@ async fn put_object(
 pub(super) type DeleteObjectsResponse =
     Result<DeleteObjectsOutput, RusotoError<DeleteObjectsError>>;
 
+/// Response to a [`HeadObjectRequest`].
+pub(super) type HeadObjectResponse =
+    Result<ObjectMeta, RusotoError<HeadObjectError>>;
+
+/// Metadata of an S3 object, returned by `GetObject` and `HeadObject`.
+#[derive(Clone, Debug)]
+pub(super) struct ObjectMeta {
+    /// `Content-Length` of the object.
+    content_length: Option<i64>,
+
+    /// `ETag` of the object.
+    e_tag: Option<String>,
+
+    /// `Last-Modified` time of the object.
+    last_modified: Option<String>,
+}
+
 /// Response to a [`HeadBucketRequest`].
 pub(super) type HeadBucketResponse = Result<(), RusotoError<HeadBucketError>>;
 
@@ -358,7 +447,7 @@ async fn try_delete_object(
 async fn try_get_object(
     bucket: impl ToString,
     key: impl ToString,
-) -> GetObjectResponse {
+) -> Result<(ObjectMeta, Vec<u8>), RusotoError<GetObjectError>> {
     let req = GetObjectRequest {
         bucket: bucket.to_string(),
         key: key.to_string(),
@@ -369,7 +458,28 @@ async fn try_get_object(
     let mut buf = Vec::new();
     resp.body.unwrap().into_async_read().read_to_end(&mut buf).await.unwrap();
 
-    Ok(buf)
+    let meta = ObjectMeta {
+        content_length: resp.content_length,
+        e_tag: resp.e_tag,
+        last_modified: resp.last_modified,
+    };
+    Ok((meta, buf))
+}
+
+/// Performs a [`HeadObjectRequest`], storing its [`HeadObjectResponse`] in the
+/// provided [`World`].
+async fn head_object(w: &mut World, bucket: String, key: String) {
+    let req = HeadObjectRequest { bucket, key, ..HeadObjectRequest::default() };
+
+    let res = s3_client().head_object(req).await.map(|resp| ObjectMeta {
+        content_length: resp.content_length,
+        e_tag: resp.e_tag,
+        last_modified: resp.last_modified,
+    });
+    if let Ok(meta) = &res {
+        w.object_metas.push(meta.clone());
+    }
+    w.head_object_response = Some(res);
 }
 
 /// Creates a new [`S3Client`] for performing requests to the S3 HTTP API being

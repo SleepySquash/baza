@@ -4,13 +4,15 @@ use std::{
     convert::Infallible,
     fmt, io,
     net::{TcpListener, ToSocketAddrs},
+    time::UNIX_EPOCH,
 };
 
 use baza::{
-    CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, GetFile,
-    InvalidRelativePathError, ReadOnlyFile, RelativePath, async_trait,
-    futures::future,
+    CreateFile, CreateSymlink, DeleteFile, DeleteFileError, Exec, FileMeta,
+    GetFile, GetFileMeta, InvalidRelativePathError, ReadOnlyFile, RelativePath,
+    async_trait, futures::future,
 };
+use chrono::{DateTime, Utc};
 use derive_more::with_trait::{Display, Error, From};
 use hyper::{server::Server, service::make_service_fn};
 use s3_server::{
@@ -74,12 +76,13 @@ pub enum RunHttpServerError {
 pub struct S3<T>(T);
 
 #[async_trait]
-impl<S, E1, E2, E3, E4> S3Storage for S3<S>
+impl<S, E1, E2, E3, E4, E5> S3Storage for S3<S>
 where
     S: Exec<CreateFile<dto::ByteStream>, Err = E1>
         + Exec<CreateSymlink, Err = E2>
         + Exec<DeleteFile, Ok = (), Err = E3>
         + Exec<GetFile, Ok = Option<ReadOnlyFile>, Err = E4>
+        + Exec<GetFileMeta, Ok = Option<FileMeta>, Err = E5>
         + fmt::Debug
         + Send
         + Sync
@@ -88,6 +91,7 @@ where
     E2: fmt::Display,
     E3: AsRef<DeleteFileError> + fmt::Display + Send,
     E4: fmt::Display,
+    E5: fmt::Display,
 {
     async fn complete_multipart_upload(
         &self,
@@ -228,11 +232,16 @@ where
                 dto::GetObjectError::NoSuchKey(input.key),
             ))?;
 
+        let headers = ObjectHeaders::try_from(file.meta())?;
         let reader = ReaderStream::new(file.compat());
 
         tracing::info!("OK");
         Ok(dto::GetObjectOutput {
             body: Some(dto::ByteStream::new(reader)),
+            content_length: Some(headers.content_length),
+            content_type: Some(headers.content_type),
+            e_tag: Some(headers.e_tag),
+            last_modified: Some(headers.last_modified),
             ..dto::GetObjectOutput::default()
         })
     }
@@ -244,11 +253,35 @@ where
         Err(not_implemented("HeadBucket").into())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(bucket = input.bucket.as_str(), key = input.key.as_str()),
+    )]
     async fn head_object(
         &self,
-        _: dto::HeadObjectRequest,
+        input: dto::HeadObjectRequest,
     ) -> S3StorageResult<dto::HeadObjectOutput, dto::HeadObjectError> {
-        Err(not_implemented("HeadObject").into())
+        let path = parse_s3_path(input.bucket, input.key.clone())?;
+
+        let meta = self
+            .0
+            .exec(GetFileMeta { path })
+            .await
+            .map_err(|e| internal_error("GetFileMeta operation failed", e))?
+            .ok_or(S3StorageError::Operation(
+                dto::HeadObjectError::NoSuchKey(input.key),
+            ))?;
+
+        let headers = ObjectHeaders::try_from(&meta)?;
+
+        tracing::info!("OK");
+        Ok(dto::HeadObjectOutput {
+            content_length: Some(headers.content_length),
+            content_type: Some(headers.content_type),
+            e_tag: Some(headers.e_tag),
+            last_modified: Some(headers.last_modified),
+            ..dto::HeadObjectOutput::default()
+        })
     }
 
     async fn list_buckets(
@@ -333,6 +366,57 @@ where
             }
             res => res,
         }
+    }
+}
+
+/// Headers describing an S3 object, shared by [`dto::GetObjectOutput`] and
+/// [`dto::HeadObjectOutput`].
+#[derive(Debug)]
+struct ObjectHeaders {
+    /// Size of the object in bytes.
+    content_length: i64,
+
+    /// MIME type of the object.
+    ///
+    /// Always `application/octet-stream`, because it's not stored anywhere.
+    content_type: String,
+
+    /// `ETag` of the object.
+    ///
+    /// It's derived from the size and the last modification time of the
+    /// object, rather than being an MD5 digest of its content, so it changes
+    /// whenever the object is overwritten, while requiring nothing to be
+    /// computed or stored. To not be mistaken for an MD5 digest, it contains a
+    /// `-`, as multipart upload `ETag`s do, so clients skip verifying the
+    /// content against it.
+    e_tag: String,
+
+    /// Last modification time of the object, in [RFC 3339] format, as
+    /// [`s3_server`] expects.
+    ///
+    /// [RFC 3339]: https://www.rfc-editor.org/rfc/rfc3339
+    last_modified: String,
+}
+
+impl TryFrom<&FileMeta> for ObjectHeaders {
+    type Error = S3Error;
+
+    fn try_from(meta: &FileMeta) -> Result<Self, Self::Error> {
+        let content_length = i64::try_from(meta.size)
+            .map_err(|e| internal_error("Object is too large", e))?;
+        // Files modified before UNIX epoch are not expected in practice.
+        let mtime = meta
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        Ok(Self {
+            content_length,
+            content_type: "application/octet-stream".into(),
+            e_tag: format!("\"{mtime:x}-{:x}\"", meta.size),
+            last_modified: DateTime::<Utc>::from(meta.modified).to_rfc3339(),
+        })
     }
 }
 
