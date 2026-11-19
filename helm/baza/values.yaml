@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/sleepysquash/baza
-  tag: "0.2"
+  tag: "0.3"
   pullPolicy: IfNotPresent
   credentials: {}
     #registry: ghcr.io

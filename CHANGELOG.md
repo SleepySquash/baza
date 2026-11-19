@@ -6,10 +6,10 @@ All user visible changes to this project will be documented in this file. This p
 
 
 
-## [0.3.0] · unreleased
-[0.3.0]: /../../tree/main
+## [0.3.0] · 2026-11-19
+[0.3.0]: /../../tree/v0.3.0
 
-[Diff](/../../compare/v0.2.0...main)
+[Diff](/../../compare/v0.2.0...v0.3.0) | [Milestone](/../../milestone/1)
 
 ### BC Breaks
 

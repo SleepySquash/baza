@@ -6,12 +6,18 @@ All user visible changes to this project will be documented in this file. This p
 
 
 
-## [0.6.0] · unreleased
-[0.6.0]: https://github.com/SleepySquash/baza/tree/main/helm/baza
+## [0.6.0] · 2026-11-19
+[0.6.0]: https://github.com/SleepySquash/baza/tree/helm%2Fbaza%2F0.6.0/helm/baza
 
 ### BC Breaks
 
 - Changed default `image.repository` value to `ghcr.io/sleepysquash/baza`.
+
+### Upgraded
+
+- [Baza Docker image] to [0.3 version][030-1].
+
+[030-1]: https://github.com/SleepySquash/baza/releases/tag/v0.3.0
 
 
 

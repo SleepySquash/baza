@@ -2,7 +2,7 @@ apiVersion: v2
 name: baza
 description: Simply scalable files storage without much fuss.
 version: 0.6.0
-appVersion: "0.2"
+appVersion: "0.3"
 type: application
 sources:
   - https://github.com/SleepySquash/baza
